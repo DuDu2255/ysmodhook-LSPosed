@@ -10,7 +10,7 @@ import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 /**
- * LSPosed 入口：只在目标游戏进程里加载 native hook 库。
+ * LSPosed 入口：只在目标游戏进程里加载并启动 native hook 库。
  * native 部分与 Zygisk 版完全一致（Vulkan draw call 拦截）。
  */
 public class Entry implements IXposedHookLoadPackage {
@@ -18,6 +18,8 @@ public class Entry implements IXposedHookLoadPackage {
     private static final String TAG = "ysmod";
     private static final String TARGET = "com.miHoYo.Yuanshen";
     private static final String SELF = "com.ysmod.hook";
+
+    private static native void start();
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
@@ -37,10 +39,11 @@ public class Entry implements IXposedHookLoadPackage {
             if (f.exists()) {
                 try {
                     System.load(f.getAbsolutePath());
-                    Log.i(TAG, "loaded ok");
+                    Log.i(TAG, "loaded ok, calling start()");
+                    start();
                     return;
                 } catch (Throwable t) {
-                    Log.e(TAG, "System.load failed: " + t);
+                    Log.e(TAG, "load/start failed: " + t);
                 }
             }
         }
