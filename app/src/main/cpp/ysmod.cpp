@@ -15,7 +15,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v0.7-lsp"
+#define YSMOD_VER "v0.8-lsp"
 
 typedef struct VkDevice_T        *VkDevice;
 typedef struct VkInstance_T      *VkInstance;
@@ -32,6 +32,7 @@ typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(VkInstance, const char *
 typedef void (*PFN_vkCmdDrawIndexed)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
 typedef void (*PFN_vkCmdBindIndexBuffer)(VkCommandBuffer, VkBuffer, VkDeviceSize, int);
 typedef void (*PFN_vkBindBufferMemory)(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
+typedef int (*PFN_vkCreateBuffer)(VkDevice, const void *, const void *, VkBuffer *);
 typedef VkResult (*PFN_vkMapMemory)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, uint32_t, void **);
 typedef void (*PFN_vkUnmapMemory)(VkDevice, VkDeviceMemory);
 
@@ -41,6 +42,7 @@ static PFN_vkGetInstanceProcAddr real_gipa = nullptr;
 static PFN_vkCmdDrawIndexed      real_draw_indexed = nullptr;
 static PFN_vkCmdBindIndexBuffer  real_bind_ib = nullptr;
 static PFN_vkBindBufferMemory    real_bind_mem = nullptr;
+static PFN_vkCreateBuffer        real_create_buf = nullptr;
 static PFN_vkMapMemory           p_map = nullptr;
 static PFN_vkUnmapMemory         p_unmap = nullptr;
 
@@ -123,7 +125,7 @@ static BufInfo *find_buf(VkBuffer b) {
 }
 
 // 简化：单独存 buffer 指针
-struct BufEnt { VkBuffer buf; VkDevice dev; VkDeviceMemory mem; VkDeviceSize off; };
+struct BufEnt { VkBuffer buf; VkDevice dev; VkDeviceMemory mem; VkDeviceSize off; VkDeviceSize size; uint32_t hash; int hashed; };
 static BufEnt g_bufent[8192];
 static int    g_bufent_n = 0;
 
@@ -133,12 +135,29 @@ static BufEnt *lookup_buf(VkBuffer b) {
     return nullptr;
 }
 
-extern "C" void ys_vkBindBufferMemory(VkDevice dev, VkBuffer buf, VkDeviceMemory mem, VkDeviceSize off) {
-    if (g_bufent_n < 8192) {
+extern "C" int ys_vkCreateBuffer(VkDevice dev, const void *ci, const void *alloc, VkBuffer *out) {
+    int r = real_create_buf ? real_create_buf(dev, ci, alloc, out) : -1;
+    if (r == 0 && ci && out && *out) {
+        VkDeviceSize size = *(const VkDeviceSize *)((const char *)ci + 24);
         pthread_mutex_lock(&g_mtx);
-        g_bufent[g_bufent_n++] = BufEnt{buf, dev, mem, off};
+        if (g_bufent_n < 8192) {
+            BufEnt e{}; e.buf = *out; e.dev = dev; e.size = size;
+            g_bufent[g_bufent_n++] = e;
+        }
         pthread_mutex_unlock(&g_mtx);
     }
+    return r;
+}
+
+extern "C" void ys_vkBindBufferMemory(VkDevice dev, VkBuffer buf, VkDeviceMemory mem, VkDeviceSize off) {
+    pthread_mutex_lock(&g_mtx);
+    BufEnt *be = lookup_buf(buf);
+    if (be) { be->dev = dev; be->mem = mem; be->off = off; }
+    else if (g_bufent_n < 8192) {
+        BufEnt n{}; n.buf = buf; n.dev = dev; n.mem = mem; n.off = off;
+        g_bufent[g_bufent_n++] = n;
+    }
+    pthread_mutex_unlock(&g_mtx);
     if (real_bind_mem) real_bind_mem(dev, buf, mem, off);
 }
 
@@ -173,18 +192,21 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
     IbBind *ib = find_ib(cb);
     if (ib && ib->buf && p_map) {
         BufEnt *e = lookup_buf(ib->buf);
-        if (e) {
-            uint32_t esz = (ib->type == 1) ? 4 : 2;
-            VkDeviceSize start = e->off + ib->off + (VkDeviceSize)firstIndex * esz;
-            VkDeviceSize len   = (VkDeviceSize)indexCount * esz;
-            void *ptr = nullptr;
-            if (p_map(e->dev, e->mem, start, len, 0, &ptr) == 0 && ptr) {
-                uint32_t h = fnv1a((const uint8_t *)ptr, (size_t)len, 0x811C9DC5u);
-                if (p_unmap) p_unmap(e->dev, e->mem);
-                if (hash_new(h))
-                    LOGI("[hash] %08x indexCount=%u firstIndex=%u vtxOff=%d",
-                         h, indexCount, firstIndex, vertexOffset);
+        if (e && e->size && e->mem) {
+            uint32_t h = 0;
+            if (e->hashed) {
+                h = e->hash;
+            } else {
+                void *ptr = nullptr;
+                if (p_map(e->dev, e->mem, e->off, e->size, 0, &ptr) == 0 && ptr) {
+                    h = fnv1a((const uint8_t *)ptr, (size_t)e->size, 0x811C9DC5u);
+                    if (p_unmap) p_unmap(e->dev, e->mem);
+                    e->hash = h; e->hashed = 1;
+                }
             }
+            if (h && hash_new(h))
+                LOGI("[ib] %08x size=%llu idx=%u first=%u vtx=%d",
+                     h, (unsigned long long)e->size, indexCount, firstIndex, vertexOffset);
         }
     }
     if (real_draw_indexed) real_draw_indexed(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
@@ -201,6 +223,10 @@ extern "C" PFN_vkVoidFunction ys_vkGetDeviceProcAddr(VkDevice dev, const char *n
     if (!strcmp(name, "vkCmdBindIndexBuffer")) {
         if (!real_bind_ib) { real_bind_ib = (PFN_vkCmdBindIndexBuffer)p; LOGI("intercept vkCmdBindIndexBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCmdBindIndexBuffer;
+    }
+    if (!strcmp(name, "vkCreateBuffer")) {
+        if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
+        return (PFN_vkVoidFunction)ys_vkCreateBuffer;
     }
     if (!strcmp(name, "vkBindBufferMemory")) {
         if (!real_bind_mem) { real_bind_mem = (PFN_vkBindBufferMemory)p; LOGI("intercept vkBindBufferMemory"); }
@@ -223,6 +249,10 @@ extern "C" PFN_vkVoidFunction ys_vkGetInstanceProcAddr(VkInstance inst, const ch
     if (!strcmp(name, "vkCmdBindIndexBuffer")) {
         if (!real_bind_ib) { real_bind_ib = (PFN_vkCmdBindIndexBuffer)p; LOGI("intercept(i) vkCmdBindIndexBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCmdBindIndexBuffer;
+    }
+    if (!strcmp(name, "vkCreateBuffer")) {
+        if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
+        return (PFN_vkVoidFunction)ys_vkCreateBuffer;
     }
     if (!strcmp(name, "vkBindBufferMemory")) {
         if (!real_bind_mem) { real_bind_mem = (PFN_vkBindBufferMemory)p; LOGI("intercept(i) vkBindBufferMemory"); }
