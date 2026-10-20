@@ -15,7 +15,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v0.8-lsp"
+#define YSMOD_VER "v0.9-lsp"
 
 typedef struct VkDevice_T        *VkDevice;
 typedef struct VkInstance_T      *VkInstance;
@@ -113,6 +113,14 @@ static uint32_t fnv1a(const uint8_t *p, size_t n, uint32_t h) {
     for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x01000193u; }
     return h;
 }
+static uint32_t fnv16(const uint16_t *p, size_t n, uint32_t h) {
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x01000193u; }
+    return h;
+}
+static uint32_t fnv32(const uint32_t *p, size_t n, uint32_t h) {
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x01000193u; }
+    return h;
+}
 
 static BufInfo *find_buf(VkBuffer b) {
     for (int i = g_bufs_n - 1; i >= 0; i--) if (g_bufs[i].dev && (VkBuffer)(uintptr_t)i == b) {}
@@ -193,20 +201,31 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
     if (ib && ib->buf && p_map) {
         BufEnt *e = lookup_buf(ib->buf);
         if (e && e->size && e->mem) {
-            uint32_t h = 0;
-            if (e->hashed) {
-                h = e->hash;
-            } else {
-                void *ptr = nullptr;
-                if (p_map(e->dev, e->mem, e->off, e->size, 0, &ptr) == 0 && ptr) {
-                    h = fnv1a((const uint8_t *)ptr, (size_t)e->size, 0x811C9DC5u);
-                    if (p_unmap) p_unmap(e->dev, e->mem);
-                    e->hash = h; e->hashed = 1;
+            uint32_t esz = (ib->type == 1) ? 4u : 2u;
+            void *ptr = nullptr;
+            if (p_map(e->dev, e->mem, e->off, e->size, 0, &ptr) == 0 && ptr) {
+                const uint8_t *base = (const uint8_t *)ptr;
+                size_t n = (size_t)e->size;
+
+                if (!e->hashed) {
+                    uint32_t a = fnv1a(base, n, 0x811C9DC5u);
+                    uint32_t b = (esz == 2) ? fnv16((const uint16_t *)base, n / 2, 0x811C9DC5u)
+                                            : fnv32((const uint32_t *)base, n / 4, 0x811C9DC5u);
+                    e->hash = a; e->hashed = 1;
+                    LOGI("[A] %08x [B] %08x size=%llu esz=%u", a, b, (unsigned long long)n, esz);
                 }
+
+                size_t start = (size_t)ib->off + (size_t)firstIndex * esz;
+                size_t len   = (size_t)indexCount * esz;
+                if (start + len <= n) {
+                    const uint8_t *r = base + start;
+                    uint32_t c = (esz == 2) ? fnv16((const uint16_t *)r, len / 2, 0x811C9DC5u)
+                                            : fnv32((const uint32_t *)r, len / 4, 0x811C9DC5u);
+                    if (hash_new(c))
+                        LOGI("[C] %08x idx=%u first=%u vtx=%d", c, indexCount, firstIndex, vertexOffset);
+                }
+                if (p_unmap) p_unmap(e->dev, e->mem);
             }
-            if (h && hash_new(h))
-                LOGI("[ib] %08x size=%llu idx=%u first=%u vtx=%d",
-                     h, (unsigned long long)e->size, indexCount, firstIndex, vertexOffset);
         }
     }
     if (real_draw_indexed) real_draw_indexed(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
