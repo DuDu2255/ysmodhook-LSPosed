@@ -14,11 +14,28 @@
 #include <math.h>
 
 #define TAG "ysmod"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+extern char *g_logpath_ptr(void);
+static void flog(const char *fmt, ...);
+#define LOGI(...) do { __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__); flog(__VA_ARGS__); } while (0)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.7-lsp"
+#define YSMOD_VER "v3.8-lsp"
 
 static char g_outdir[256] = {0};
+
+#include <stdarg.h>
+static void flog(const char *fmt, ...) {
+    if (!g_outdir[0]) return;
+    char p[300];
+    snprintf(p, sizeof(p), "%s/ysmod.log", g_outdir);
+    FILE *f = fopen(p, "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+char *g_logpath_ptr(void) { return g_outdir; }
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
 static int  g_cfg_ib = 1;      // 替换索引缓冲
 static int  g_cfg_vb = 1;      // 替换顶点缓冲
@@ -1089,15 +1106,20 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                         BufEnt *ve = (vr && vr->buf[0]) ? lookup_buf(vr->buf[0]) : nullptr;
                         if (ve && ve->size) {
                             if (g_stage_state == 0) {
-                                if (!g_stage_buf) g_stage_buf = make_stage(ve->dev, (size_t)ve->size, &g_stage_ptr, &g_stage_mem);
+                                VkDeviceSize need = ve->size + (VkDeviceSize)g_vb_pos_sz;
+                                if (!g_stage_buf) g_stage_buf = make_stage(ve->dev, (size_t)need, &g_stage_ptr, &g_stage_mem);
                                 if (g_stage_buf && g_stage_ptr) {
-                                    VkDeviceSize nn = ve->size < g_stage_sz ? ve->size : g_stage_sz;
-                                    CopyRegion cr{0, 0, nn};
+                                    // [0, mod) 放我们自己已知的 mod 顶点，[mod, mod+vb) 放游戏的原版顶点
+                                    if (g_buf_pos && g_vb_pos_sz) {
+                                        CopyRegion c0{0, 0, (VkDeviceSize)g_vb_pos_sz};
+                                        real_copy_buf(cb, g_buf_pos, g_stage_buf, 1, &c0);
+                                    }
+                                    CopyRegion cr{0, (VkDeviceSize)g_vb_pos_sz, ve->size};
                                     real_copy_buf(cb, vr->buf[0], g_stage_buf, 1, &cr);
                                     g_stage_state = 1;
-                                    LOGI("vbdump: recorded %llu bytes (vb size %llu)",
-                                         (unsigned long long)nn, (unsigned long long)ve->size);
-                                }
+                                    LOGI("vbdump: recorded vb=%llu mod=%zu stage=%llu",
+                                         (unsigned long long)ve->size, g_vb_pos_sz, (unsigned long long)g_stage_sz);
+                                } else LOGI("vbdump: stage alloc failed (need=%llu)", (unsigned long long)need);
                             } else if (g_stage_state == 1) {
                                 invalidate_mem(ve->dev, g_stage_mem, 0, g_stage_sz);
                                 char path[400];
