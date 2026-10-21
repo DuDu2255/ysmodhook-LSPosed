@@ -11,14 +11,99 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <math.h>
 
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v1.1-lsp"
+#define YSMOD_VER "v1.5-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
+static int  g_cfg_ib = 1;      // 替换索引缓冲
+static int  g_cfg_vb = 1;      // 替换顶点缓冲
+
+// ── mod 资源 ──────────────────────────────────────────────────────
+static uint32_t *g_ib_mod[3] = {nullptr, nullptr, nullptr};   // head/body/dress
+static size_t    g_ib_mod_n[3] = {0, 0, 0};
+static uint8_t  *g_vb_pos = nullptr;   static size_t g_vb_pos_sz = 0;
+static uint8_t  *g_vb_blend = nullptr; static size_t g_vb_blend_sz = 0;
+static uint8_t  *g_vb_uv = nullptr;    static size_t g_vb_uv_sz = 0;
+static int g_vb_ready = 0;
+
+static uint8_t *load_file(const char *dir, const char *name, size_t *outsz) {
+    char p[400];
+    snprintf(p, sizeof(p), "%s/mod/%s", dir, name);
+    FILE *f = fopen(p, "rb");
+    if (!f) { LOGE("mod missing: %s", p); return nullptr; }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return nullptr; }
+    uint8_t *b = (uint8_t *)malloc((size_t)sz);
+    if (!b) { fclose(f); return nullptr; }
+    if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return nullptr; }
+    fclose(f);
+    *outsz = (size_t)sz;
+    return b;
+}
+
+static void load_mod(const char *dir) {
+    size_t sz = 0;
+    uint8_t *p;
+    p = load_file(dir, "head.ib", &sz);  if (p) { g_ib_mod[0] = (uint32_t *)p; g_ib_mod_n[0] = sz / 4; }
+    p = load_file(dir, "body.ib", &sz);  if (p) { g_ib_mod[1] = (uint32_t *)p; g_ib_mod_n[1] = sz / 4; }
+    p = load_file(dir, "dress.ib", &sz); if (p) { g_ib_mod[2] = (uint32_t *)p; g_ib_mod_n[2] = sz / 4; }
+    g_vb_pos   = load_file(dir, "position.buf", &g_vb_pos_sz);
+    g_vb_blend = load_file(dir, "blend.buf",    &g_vb_blend_sz);
+    g_vb_uv    = load_file(dir, "texcoord.buf", &g_vb_uv_sz);
+    g_vb_ready = (g_vb_pos && g_vb_blend && g_vb_uv);
+    LOGI("mod: ib=%zu/%zu/%zu pos=%zu blend=%zu uv=%zu",
+         g_ib_mod_n[0], g_ib_mod_n[1], g_ib_mod_n[2],
+         g_vb_pos_sz, g_vb_blend_sz, g_vb_uv_sz);
+}
+
+// 通过内容判断这个顶点缓冲属于哪一路（40=position / 32=blend / 20=texcoord）
+static int vb_classify(const uint8_t *p, size_t size) {
+    int best = 0, bestscore = 0;
+    if (size >= 40 * 16) {
+        int n = (int)(size / 40); if (n > 64) n = 64;
+        int s = 0;
+        for (int i = 0; i < n; i++) {
+            const float *f = (const float *)(p + (size_t)i * 40);
+            int ok = 1;
+            for (int k = 0; k < 3; k++) if (!(f[k] > -1e5f && f[k] < 1e5f)) ok = 0;
+            if (ok && (fabsf(f[0]) > 2.f || fabsf(f[1]) > 2.f || fabsf(f[2]) > 2.f)) s++;
+        }
+        if (s * 2 > n && s > bestscore) { best = 40; bestscore = s; }
+    }
+    if (size >= 32 * 16) {
+        int n = (int)(size / 32); if (n > 64) n = 64;
+        int s = 0;
+        for (int i = 0; i < n; i++) {
+            const uint8_t *q = p + (size_t)i * 32;
+            const uint16_t *u = (const uint16_t *)q;
+            const float *w = (const float *)(q + 8);
+            int ok = 1;
+            for (int k = 0; k < 4; k++) if (u[k] > 8192) ok = 0;
+            float sum = 0.f;
+            for (int k = 0; k < 4; k++) {
+                if (!(w[k] >= -0.01f && w[k] <= 1.01f)) ok = 0;
+                sum += w[k];
+            }
+            if (ok && fabsf(sum - 1.f) < 0.05f) s++;
+        }
+        if (s * 2 > n && s > bestscore) { best = 32; bestscore = s; }
+    }
+    if (size >= 20 * 16) {
+        int n = (int)(size / 20); if (n > 64) n = 64;
+        int s = 0;
+        for (int i = 0; i < n; i++) {
+            const float *f = (const float *)(p + (size_t)i * 20);
+            if (f[0] > -2.f && f[0] < 2.f && f[1] > -2.f && f[1] < 2.f) s++;
+        }
+        if (s * 4 > n * 3 && s > bestscore) { best = 20; bestscore = s; }
+    }
+    return best;
+}
 
 typedef struct VkDevice_T        *VkDevice;
 typedef struct VkInstance_T      *VkInstance;
@@ -34,6 +119,8 @@ typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(VkInstance, const char *
 
 typedef void (*PFN_vkCmdDrawIndexed)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
 typedef void (*PFN_vkCmdBindIndexBuffer)(VkCommandBuffer, VkBuffer, VkDeviceSize, int);
+typedef void (*PFN_vkCmdBindVertexBuffers)(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer *, const VkDeviceSize *);
+typedef void (*PFN_vkCmdBindVertexBuffers2)(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer *, const VkDeviceSize *, const VkDeviceSize *, const VkDeviceSize *);
 typedef void (*PFN_vkBindBufferMemory)(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
 typedef int (*PFN_vkCreateBuffer)(VkDevice, const void *, const void *, VkBuffer *);
 typedef VkResult (*PFN_vkMapMemory)(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, uint32_t, void **);
@@ -44,6 +131,8 @@ static PFN_vkGetDeviceProcAddr   real_gdpa = nullptr;
 static PFN_vkGetInstanceProcAddr real_gipa = nullptr;
 static PFN_vkCmdDrawIndexed      real_draw_indexed = nullptr;
 static PFN_vkCmdBindIndexBuffer  real_bind_ib = nullptr;
+static PFN_vkCmdBindVertexBuffers  real_bind_vb = nullptr;
+static PFN_vkCmdBindVertexBuffers2 real_bind_vb2 = nullptr;
 static PFN_vkBindBufferMemory    real_bind_mem = nullptr;
 static PFN_vkCreateBuffer        real_create_buf = nullptr;
 static PFN_vkMapMemory           p_map = nullptr;
@@ -58,6 +147,22 @@ static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 // cmd buffer -> 当前绑定的 IB
 struct IbBind { VkCommandBuffer cb; VkBuffer buf; VkDeviceSize off; int type; };
 static IbBind g_ib[256];
+
+// ── 顶点缓冲绑定跟踪 ──────────────────────────────────────────────
+struct VbRec { VkCommandBuffer cb; VkBuffer buf[8]; VkDeviceSize off[8]; int used; };
+static VbRec g_vbrec[256];
+static int   g_vbrec_n = 0;
+
+static VbRec *vbrec_get(VkCommandBuffer cb, int create) {
+    for (int i = 0; i < g_vbrec_n; i++) if (g_vbrec[i].cb == cb) return &g_vbrec[i];
+    if (!create || g_vbrec_n >= 256) return nullptr;
+    VbRec *r = &g_vbrec[g_vbrec_n++];
+    memset(r, 0, sizeof(*r));
+    r->cb = cb;
+    return r;
+}
+
+
 static int    g_ib_n = 0;
 
 static bool pcrel(uint32_t w) {
@@ -183,6 +288,34 @@ extern "C" void ys_vkBindBufferMemory(VkDevice dev, VkBuffer buf, VkDeviceMemory
     if (real_bind_mem) real_bind_mem(dev, buf, mem, off);
 }
 
+extern "C" void ys_vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                                          const VkBuffer *bufs, const VkDeviceSize *offs) {
+    pthread_mutex_lock(&g_mtx);
+    VbRec *r = vbrec_get(cb, 1);
+    if (r && bufs) for (uint32_t i = 0; i < count && first + i < 8; i++) {
+        r->buf[first + i] = bufs[i];
+        r->off[first + i] = offs ? offs[i] : 0;
+        r->used |= 1 << (first + i);
+    }
+    pthread_mutex_unlock(&g_mtx);
+    if (real_bind_vb) real_bind_vb(cb, first, count, bufs, offs);
+}
+
+extern "C" void ys_vkCmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                                           const VkBuffer *bufs, const VkDeviceSize *offs,
+                                           const VkDeviceSize *sizes, const VkDeviceSize *strides) {
+    pthread_mutex_lock(&g_mtx);
+    VbRec *r = vbrec_get(cb, 1);
+    if (r && bufs) for (uint32_t i = 0; i < count && first + i < 8; i++) {
+        r->buf[first + i] = bufs[i];
+        r->off[first + i] = offs ? offs[i] : 0;
+        r->used |= 1 << (first + i);
+    }
+    pthread_mutex_unlock(&g_mtx);
+    if (real_bind_vb2) real_bind_vb2(cb, first, count, bufs, offs, sizes, strides);
+    else if (real_bind_vb) real_bind_vb(cb, first, count, bufs, offs);
+}
+
 extern "C" void ys_vkCmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, int type) {
     pthread_mutex_lock(&g_mtx);
     bool found = false;
@@ -201,6 +334,61 @@ static bool hash_new(uint32_t h) {
     for (int i = 0; i < g_hashes_n; i++) if (g_hashes[i] == h) return false;
     if (g_hashes_n < 512) { g_hashes[g_hashes_n++] = h; return true; }
     return false;
+}
+
+static const uint32_t PART_FIRST[3] = {0u, 28278u, 71181u};
+static const uint32_t PART_COUNT[3] = {28278u, 42903u, 2634u};
+
+typedef int (*PFN_vkFlushMappedMemoryRanges)(VkDevice, uint32_t, const void *);
+static PFN_vkFlushMappedMemoryRanges p_flush = nullptr;
+
+static void flush_mem(VkDevice dev, VkDeviceMemory mem, VkDeviceSize off, VkDeviceSize size) {
+    if (!p_flush || !mem) return;
+    struct Range { VkDeviceMemory m; VkDeviceSize o, s; } r{mem, off, size};
+    p_flush(dev, 1, &r);
+}
+
+// 把一个部件的 mod 数据写进游戏正在用的缓冲（就地替换）
+static void replace_part(VkCommandBuffer cb, int part, const uint8_t *base, const IbBind *ib, BufEnt *ie) {
+    if (g_cfg_vb && g_vb_ready) {
+        VbRec *r = vbrec_get(cb, 0);
+        if (r) {
+            int cls[8] = {0};
+            for (int i = 0; i < 8; i++) {
+                if (!(r->used & (1 << i)) || !r->buf[i]) continue;
+                BufEnt *be = lookup_buf(r->buf[i]);
+                if (!be || !be->mem || !p_map) continue;
+                void *p = nullptr;
+                if (p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) continue;
+                if ((size_t)r->off[i] < (size_t)be->size)
+                    cls[i] = vb_classify((const uint8_t *)p + r->off[i], (size_t)be->size - (size_t)r->off[i]);
+                if (p_unmap) p_unmap(be->dev, be->mem);
+            }
+            for (int i = 0; i < 8; i++) {
+                if (!cls[i]) continue;
+                const uint8_t *src = (cls[i] == 40) ? g_vb_pos : (cls[i] == 32) ? g_vb_blend : g_vb_uv;
+                size_t ssz = (cls[i] == 40) ? g_vb_pos_sz : (cls[i] == 32) ? g_vb_blend_sz : g_vb_uv_sz;
+                if (!src || !ssz) continue;
+                BufEnt *be = lookup_buf(r->buf[i]);
+                if (!be || !be->mem) continue;
+                if ((size_t)r->off[i] + ssz > (size_t)be->size) { LOGE("vb%d too small %llu<%zu", i, (unsigned long long)be->size, ssz); continue; }
+                void *p = nullptr;
+                if (p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) continue;
+                memcpy((uint8_t *)p + r->off[i], src, ssz);
+                flush_mem(be->dev, be->mem, be->off, be->size);
+                if (p_unmap) p_unmap(be->dev, be->mem);
+            }
+            static int lg = 0;
+            if (!lg) { lg = 1; LOGI("vb cls %d %d %d %d %d %d %d %d", cls[0], cls[1], cls[2], cls[3], cls[4], cls[5], cls[6], cls[7]); }
+        }
+    }
+    if (g_cfg_ib && g_ib_mod[part] && g_ib_mod_n[part]) {
+        uint16_t *dst = (uint16_t *)(base + (size_t)ib->off + (size_t)PART_FIRST[part] * 2);
+        for (size_t i = 0; i < g_ib_mod_n[part]; i++) dst[i] = (uint16_t)(g_ib_mod[part][i] & 0xFFFF);
+        if (ie) flush_mem(ie->dev, ie->mem, ie->off, ie->size);
+        static int lg2 = 0;
+        if (!lg2) { lg2 = 1; LOGI("ib replaced part=%d n=%zu", part, g_ib_mod_n[part]); }
+    }
 }
 
 static IbBind *find_ib(VkCommandBuffer cb) {
@@ -263,6 +451,16 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                         if (!logged) { logged = 1; LOGI("TEST: skip head draw"); }
                         indexCount = 0;
                     }
+                    // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
+                    if (n == 147630) {
+                        int part = -1;
+                        for (int pi = 0; pi < 3; pi++)
+                            if (firstIndex == PART_FIRST[pi] && indexCount == PART_COUNT[pi]) part = pi;
+                        if (part >= 0) {
+                            replace_part(cb, part, base, ib, e);
+                            if (g_cfg_ib && g_ib_mod_n[part]) indexCount = (uint32_t)g_ib_mod_n[part];
+                        }
+                    }
                 }
                 if (p_unmap) p_unmap(e->dev, e->mem);
             }
@@ -291,6 +489,15 @@ extern "C" PFN_vkVoidFunction ys_vkGetDeviceProcAddr(VkDevice dev, const char *n
         if (!real_bind_mem) { real_bind_mem = (PFN_vkBindBufferMemory)p; LOGI("intercept vkBindBufferMemory"); }
         return (PFN_vkVoidFunction)ys_vkBindBufferMemory;
     }
+    if (!strcmp(name, "vkCmdBindVertexBuffers")) {
+        if (!real_bind_vb) { real_bind_vb = (PFN_vkCmdBindVertexBuffers)p; LOGI("intercept vkCmdBindVertexBuffers"); }
+        return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers;
+    }
+    if (!strcmp(name, "vkCmdBindVertexBuffers2")) {
+        if (!real_bind_vb2) { real_bind_vb2 = (PFN_vkCmdBindVertexBuffers2)p; LOGI("intercept vkCmdBindVertexBuffers2"); }
+        return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers2;
+    }
+    if (!strcmp(name, "vkFlushMappedMemoryRanges")) { if (!p_flush) p_flush = (PFN_vkFlushMappedMemoryRanges)p; return p; }
     if (!strcmp(name, "vkMapMemory"))   { if (!p_map)   p_map   = (PFN_vkMapMemory)p;   return p; }
     if (!strcmp(name, "vkUnmapMemory")) { if (!p_unmap) p_unmap = (PFN_vkUnmapMemory)p; return p; }
     return p;
@@ -317,6 +524,15 @@ extern "C" PFN_vkVoidFunction ys_vkGetInstanceProcAddr(VkInstance inst, const ch
         if (!real_bind_mem) { real_bind_mem = (PFN_vkBindBufferMemory)p; LOGI("intercept(i) vkBindBufferMemory"); }
         return (PFN_vkVoidFunction)ys_vkBindBufferMemory;
     }
+    if (!strcmp(name, "vkCmdBindVertexBuffers")) {
+        if (!real_bind_vb) { real_bind_vb = (PFN_vkCmdBindVertexBuffers)p; LOGI("intercept vkCmdBindVertexBuffers"); }
+        return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers;
+    }
+    if (!strcmp(name, "vkCmdBindVertexBuffers2")) {
+        if (!real_bind_vb2) { real_bind_vb2 = (PFN_vkCmdBindVertexBuffers2)p; LOGI("intercept vkCmdBindVertexBuffers2"); }
+        return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers2;
+    }
+    if (!strcmp(name, "vkFlushMappedMemoryRanges")) { if (!p_flush) p_flush = (PFN_vkFlushMappedMemoryRanges)p; return p; }
     if (!strcmp(name, "vkMapMemory"))   { if (!p_map)   p_map   = (PFN_vkMapMemory)p;   return p; }
     if (!strcmp(name, "vkUnmapMemory")) { if (!p_unmap) p_unmap = (PFN_vkUnmapMemory)p; return p; }
     return p;
@@ -377,13 +593,16 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir) {
             char line[128];
             while (fgets(line, sizeof(line), f)) {
                 if (!strncmp(line, "test=", 5)) g_test_mode = atoi(line + 5);
+                else if (!strncmp(line, "ib=", 3)) g_cfg_ib = atoi(line + 3);
+                else if (!strncmp(line, "vb=", 3)) g_cfg_vb = atoi(line + 3);
             }
             fclose(f);
-            LOGI("cfg test=%d", g_test_mode);
+            LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
         } else {
             LOGI("cfg not found (%s)", cfg);
         }
     }
+    load_mod(g_outdir);
     pthread_t t;
     if (pthread_create(&t, nullptr, worker, nullptr) == 0) pthread_detach(t);
 }
