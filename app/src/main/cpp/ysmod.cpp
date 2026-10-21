@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.0-lsp"
+#define YSMOD_VER "v3.1-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -160,6 +160,25 @@ static PFN_vkCmdBindPipeline         real_bind_pipe = nullptr;
 static PFN_vkCmdDispatch             real_dispatch = nullptr;
 typedef VkResult (*PFN_vkCreateGraphicsPipelines)(VkDevice, void *, uint32_t, const void *, const void *, void **);
 typedef void (*PFN_vkCmdDraw)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+// ── 描述符追踪（找骨骼矩阵 UBO）─────────────────────────────────
+typedef void (*PFN_vkUpdateDescriptorSets)(VkDevice, uint32_t, const void *, uint32_t, const void *);
+typedef void (*PFN_vkCmdBindDescriptorSets)(VkCommandBuffer, int, void *, uint32_t, uint32_t, const void **, uint32_t, const uint32_t *);
+static PFN_vkUpdateDescriptorSets    real_update_desc = nullptr;
+static PFN_vkCmdBindDescriptorSets   real_bind_desc = nullptr;
+
+struct DescBufInfo { void *buffer; VkDeviceSize offset, range; };
+struct WriteDescSet {
+    int sType; const void *pNext; void *dstSet;
+    uint32_t dstBinding, dstArrayElement, descriptorCount, descriptorType;
+    const void *pImageInfo; const DescBufInfo *pBufferInfo; const void *pTexelBufferView;
+};
+struct DescEnt { void *set; uint32_t binding; VkBuffer buf; VkDeviceSize off, range; };
+static DescEnt g_desc[8192];
+static int     g_desc_n = 0;
+struct DSetRec { VkCommandBuffer cb; void *sets[8]; int n; };
+static DSetRec g_dset[128];
+static int     g_dset_n = 0;
+
 static PFN_vkCreateGraphicsPipelines real_create_gpipe = nullptr;
 static PFN_vkCmdDraw                 real_cmd_draw = nullptr;
 static uint32_t g_cur_gpipe[256];
@@ -772,6 +791,76 @@ static bool gpu_replace(VkCommandBuffer cb, int part, const IbBind *ib, VkDevice
     return true;
 }
 
+extern "C" void ys_vkUpdateDescriptorSets(VkDevice dev, uint32_t wcount, const void *writes,
+                                          uint32_t ccount, const void *copies) {
+    const WriteDescSet *w = (const WriteDescSet *)writes;
+    for (uint32_t i = 0; w && i < wcount; i++) {
+        if (w[i].descriptorType < 6 || w[i].descriptorType > 9) continue;
+        const DescBufInfo *bi = w[i].pBufferInfo;
+        if (!bi) continue;
+        uint32_t cnt = w[i].descriptorCount ? w[i].descriptorCount : 1;
+        for (uint32_t k = 0; k < cnt && k < 8 && g_desc_n < 8192; k++) {
+            DescEnt &e = g_desc[g_desc_n++];
+            e.set = w[i].dstSet;
+            e.binding = w[i].dstBinding + k;
+            e.buf = (VkBuffer)bi[k].buffer;
+            e.off = bi[k].offset;
+            e.range = bi[k].range;
+        }
+    }
+    if (real_update_desc) real_update_desc(dev, wcount, writes, ccount, copies);
+}
+
+extern "C" void ys_vkCmdBindDescriptorSets(VkCommandBuffer cb, int bindPoint, void *layout,
+                                           uint32_t firstSet, uint32_t count, const void **sets,
+                                           uint32_t dynCount, const uint32_t *dyn) {
+    DSetRec *r = nullptr;
+    for (int i = 0; i < g_dset_n; i++) if (g_dset[i].cb == cb) { r = &g_dset[i]; break; }
+    if (!r && g_dset_n < 128) { r = &g_dset[g_dset_n++]; memset(r, 0, sizeof(*r)); r->cb = cb; }
+    if (r && sets) for (uint32_t i = 0; i < count && i < 8; i++) {
+        r->sets[i] = (void *)sets[i];
+        if ((int)i >= r->n) r->n = (int)i + 1;
+    }
+    if (real_bind_desc) real_bind_desc(cb, bindPoint, layout, firstSet, count, sets, dynCount, dyn);
+}
+
+// 导出当前 draw 通过描述符绑定的小 buffer（骨骼矩阵通常在这里）
+static void dump_ubo(VkCommandBuffer cb) {
+    DSetRec *r = nullptr;
+    for (int i = 0; i < g_dset_n; i++) if (g_dset[i].cb == cb) { r = &g_dset[i]; break; }
+    if (!r) { LOGE("ubo: no descriptor sets for cb"); return; }
+    VkBuffer seen[16]; int seen_n = 0, dumped = 0;
+    for (int i = 0; i < g_desc_n && dumped < 16; i++) {
+        bool bound = false;
+        for (int s = 0; s < r->n; s++) if (r->sets[s] && r->sets[s] == g_desc[i].set) bound = true;
+        if (!bound) continue;
+        VkDeviceSize range = g_desc[i].range;
+        if (range < 1024 || range > 131072) continue;
+        bool dup = false;
+        for (int k = 0; k < seen_n; k++) if (seen[k] == g_desc[i].buf) dup = true;
+        if (dup) continue;
+        if (seen_n < 16) seen[seen_n++] = g_desc[i].buf;
+        BufEnt *be = lookup_buf(g_desc[i].buf);
+        if (!be || !be->mem || !p_map) continue;
+        void *p = nullptr;
+        if (p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) continue;
+        invalidate_mem(be->dev, be->mem, be->off, be->size);
+        VkDeviceSize sz = range;
+        if (g_desc[i].off + sz > be->size) sz = be->size - g_desc[i].off;
+        char path[400];
+        snprintf(path, sizeof(path), "%s/ubo_b%u_%llu.bin", g_outdir, g_desc[i].binding, (unsigned long long)sz);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite((const uint8_t *)p + g_desc[i].off, 1, (size_t)sz, f);
+            fclose(f);
+            LOGI("dumped %s (binding %u)", path, g_desc[i].binding);
+            dumped++;
+        }
+        if (p_unmap) p_unmap(be->dev, be->mem);
+    }
+    LOGI("ubo dump done: %d, desc=%d, sets=%d", dumped, g_desc_n, r->n);
+}
+
 // 导出当前 draw 绑定的所有顶点缓冲，用于离线分析真实布局
 static void dump_vbs(VkCommandBuffer cb) {
     VbRec *r = vbrec_get(cb, 0);
@@ -903,7 +992,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
                     if (g_enabled && g_cfg_enable && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
-                        if (!dumped && firstIndex == 71181 && g_cfg_dump) { dumped = 1; dump_vbs(cb); list_bufs(); }
+                        if (!dumped && firstIndex == 71181 && g_cfg_dump) { dumped = 1; dump_vbs(cb); list_bufs(); dump_ubo(cb); }
                         if (g_cfg_probe == 1) probe_shift(cb, 0, 40, 3, 10.0f);   // 位置 +10
                         else if (g_cfg_probe == 2) probe_shift(cb, 1, 20, 2, 0.5f); // UV +0.5
                         int part = -1;
@@ -948,6 +1037,14 @@ extern "C" PFN_vkVoidFunction ys_vkGetDeviceProcAddr(VkDevice dev, const char *n
     if (!strcmp(name, "vkCreateBuffer")) {
         if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCreateBuffer;
+    }
+    if (!strcmp(name, "vkUpdateDescriptorSets")) {
+        if (!real_update_desc) { real_update_desc = (PFN_vkUpdateDescriptorSets)p; LOGI("intercept vkUpdateDescriptorSets"); }
+        return (PFN_vkVoidFunction)ys_vkUpdateDescriptorSets;
+    }
+    if (!strcmp(name, "vkCmdBindDescriptorSets")) {
+        if (!real_bind_desc) { real_bind_desc = (PFN_vkCmdBindDescriptorSets)p; LOGI("intercept vkCmdBindDescriptorSets"); }
+        return (PFN_vkVoidFunction)ys_vkCmdBindDescriptorSets;
     }
     if (!strcmp(name, "vkCreateGraphicsPipelines")) {
         if (!real_create_gpipe) { real_create_gpipe = (PFN_vkCreateGraphicsPipelines)p; LOGI("intercept vkCreateGraphicsPipelines"); }
@@ -1024,6 +1121,14 @@ extern "C" PFN_vkVoidFunction ys_vkGetInstanceProcAddr(VkInstance inst, const ch
     if (!strcmp(name, "vkCreateBuffer")) {
         if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCreateBuffer;
+    }
+    if (!strcmp(name, "vkUpdateDescriptorSets")) {
+        if (!real_update_desc) { real_update_desc = (PFN_vkUpdateDescriptorSets)p; LOGI("intercept vkUpdateDescriptorSets"); }
+        return (PFN_vkVoidFunction)ys_vkUpdateDescriptorSets;
+    }
+    if (!strcmp(name, "vkCmdBindDescriptorSets")) {
+        if (!real_bind_desc) { real_bind_desc = (PFN_vkCmdBindDescriptorSets)p; LOGI("intercept vkCmdBindDescriptorSets"); }
+        return (PFN_vkVoidFunction)ys_vkCmdBindDescriptorSets;
     }
     if (!strcmp(name, "vkCreateGraphicsPipelines")) {
         if (!real_create_gpipe) { real_create_gpipe = (PFN_vkCreateGraphicsPipelines)p; LOGI("intercept vkCreateGraphicsPipelines"); }
