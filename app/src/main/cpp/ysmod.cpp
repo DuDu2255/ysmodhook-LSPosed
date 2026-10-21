@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.7-lsp"
+#define YSMOD_VER "v2.8-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -158,6 +158,14 @@ static PFN_vkCreateShaderModule      real_create_shader = nullptr;
 static PFN_vkCreateComputePipelines  real_create_cpipe = nullptr;
 static PFN_vkCmdBindPipeline         real_bind_pipe = nullptr;
 static PFN_vkCmdDispatch             real_dispatch = nullptr;
+typedef VkResult (*PFN_vkCreateGraphicsPipelines)(VkDevice, void *, uint32_t, const void *, const void *, void **);
+typedef void (*PFN_vkCmdDraw)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+static PFN_vkCreateGraphicsPipelines real_create_gpipe = nullptr;
+static PFN_vkCmdDraw                 real_cmd_draw = nullptr;
+static uint32_t g_cur_gpipe[256];
+static VkCommandBuffer g_gcb_slot[256];
+static uint64_t g_gdraw_seen[128];
+static int      g_gdraw_n = 0;
 
 static uint32_t g_shader_hash[2048];      // shaderModule -> hash
 static int      g_shader_hash_n = 0;
@@ -364,6 +372,15 @@ extern "C" int ys_vkCreateComputePipelines(VkDevice dev, void *cache, uint32_t c
 }
 
 extern "C" void ys_vkCmdBindPipeline(VkCommandBuffer cb, int bindPoint, void *pipe) {
+    if (bindPoint == 1) {   // GRAPHICS
+        int slot = -1, empty = -1;
+        for (int i = 0; i < 256; i++) {
+            if (g_gcb_slot[i] == cb) { slot = i; break; }
+            if (!g_gcb_slot[i] && empty < 0) empty = i;
+        }
+        if (slot < 0) slot = empty;
+        if (slot >= 0) { g_gcb_slot[slot] = cb; g_cur_gpipe[slot] = pipe_hash_of(pipe); }
+    }
     if (bindPoint == 0) {   // VK_PIPELINE_BIND_POINT_COMPUTE
         int slot = -1, empty = -1;
         for (int i = 0; i < 256; i++) {
@@ -374,6 +391,47 @@ extern "C" void ys_vkCmdBindPipeline(VkCommandBuffer cb, int bindPoint, void *pi
         if (slot >= 0) { g_cb_slot[slot] = cb; g_cur_cpipe[slot] = pipe_hash_of(pipe); }
     }
     if (real_bind_pipe) real_bind_pipe(cb, bindPoint, pipe);
+}
+
+extern "C" int ys_vkCreateGraphicsPipelines(VkDevice dev, void *cache, uint32_t count,
+                                            const void *cis, const void *alloc, void **out) {
+    int r = real_create_gpipe ? real_create_gpipe(dev, cache, count, cis, alloc, out) : -1;
+    if (r == 0 && cis && out) {
+        for (uint32_t i = 0; i < count; i++) {
+            const uint8_t *base = (const uint8_t *)cis + (size_t)i * 104;  // sizeof(VkGraphicsPipelineCreateInfo)
+            uint32_t sc = *(const uint32_t *)(base + 20);
+            const uint8_t *stages = *(const uint8_t *const *)(base + 24);
+            void *frag = nullptr;
+            for (uint32_t s = 0; s < sc && stages; s++) {
+                const uint8_t *st = stages + (size_t)s * 48;
+                int bit = *(const int *)(st + 20);
+                if (bit == 0x10) { frag = *(void *const *)(st + 24); break; }   // FRAGMENT
+                if (s == 0) frag = *(void *const *)(st + 24);
+            }
+            if (out[i] && g_pipe_hash_n < 4096) {
+                g_pipe_ptr[g_pipe_hash_n] = out[i];
+                g_pipe_hash[g_pipe_hash_n] = frag ? shader_hash_of(frag) : 0;
+                g_pipe_hash_n++;
+            }
+        }
+    }
+    return r;
+}
+
+extern "C" void ys_vkCmdDraw(VkCommandBuffer cb, uint32_t vcount, uint32_t icount,
+                             uint32_t fvertex, uint32_t finstance) {
+    uint32_t h = 0;
+    for (int i = 0; i < 256; i++) if (g_gcb_slot[i] == cb) { h = g_cur_gpipe[i]; break; }
+    if (h && vcount <= 8) {
+        uint64_t key = ((uint64_t)h << 16) | (vcount & 0xFFFF);
+        bool seen = false;
+        for (int i = 0; i < g_gdraw_n; i++) if (g_gdraw_seen[i] == key) { seen = true; break; }
+        if (!seen && g_gdraw_n < 128) {
+            g_gdraw_seen[g_gdraw_n++] = key;
+            LOGI("fulldraw %08x verts=%u", h, vcount);
+        }
+    }
+    if (real_cmd_draw) real_cmd_draw(cb, vcount, icount, fvertex, finstance);
 }
 
 extern "C" void ys_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
@@ -552,6 +610,7 @@ struct AllocInfo { int sType; const void *pNext; VkDeviceSize size; uint32_t mem
 struct CopyRegion { VkDeviceSize srcOffset, dstOffset, size; };
 
 static int g_cfg_mode = 2;   // 1 = CPU 直写（会闪），2 = GPU 拷贝
+static int g_copy_pos = 1, g_copy_uv = 1, g_copy_ib = 1, g_copy_blend = 1;
 
 static int find_mem_type(uint32_t bits) {
     if (!g_phys || !real_get_mem_props) return -1;
@@ -621,20 +680,20 @@ static bool gpu_replace(VkCommandBuffer cb, int part, const IbBind *ib, VkDevice
     ensure_mod_buffers(dev);
     VbRec *r = vbrec_get(cb, 0);
     CopyRegion rg{};
-    if (g_buf_pos && r && r->buf[0]) {
+    if (g_copy_pos && g_buf_pos && r && r->buf[0]) {
         rg = CopyRegion{0, r->off[0], (VkDeviceSize)g_vb_pos_sz};
         real_copy_buf(cb, g_buf_pos, r->buf[0], 1, &rg);
     }
-    if (g_buf_uv && r && r->buf[1]) {
+    if (g_copy_uv && g_buf_uv && r && r->buf[1]) {
         rg = CopyRegion{0, r->off[1], (VkDeviceSize)g_vb_uv_sz};
         real_copy_buf(cb, g_buf_uv, r->buf[1], 1, &rg);
     }
-    if (g_buf_ib[part] && g_ib_mod_n[part]) {
+    if (g_copy_ib && g_buf_ib[part] && g_ib_mod_n[part]) {
         rg = CopyRegion{0, ib->off + (VkDeviceSize)PART_FIRST[part] * 2, (VkDeviceSize)(g_ib_mod_n[part] * 2)};
         real_copy_buf(cb, g_buf_ib[part], ib->buf, 1, &rg);
     }
     // 骨骼权重（原版按顶点 32 字节，走 SSBO，不在顶点绑定里）——按尺寸定位
-    if (g_buf_blend && g_blend_size > 0) {
+    if (g_copy_blend && g_buf_blend && g_blend_size > 0) {
         VkBuffer tgt = nullptr;
         VkDeviceSize toff = 0;
         BufEnt *tb = nullptr;
@@ -853,6 +912,14 @@ extern "C" PFN_vkVoidFunction ys_vkGetDeviceProcAddr(VkDevice dev, const char *n
         if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCreateBuffer;
     }
+    if (!strcmp(name, "vkCreateGraphicsPipelines")) {
+        if (!real_create_gpipe) { real_create_gpipe = (PFN_vkCreateGraphicsPipelines)p; LOGI("intercept vkCreateGraphicsPipelines"); }
+        return (PFN_vkVoidFunction)ys_vkCreateGraphicsPipelines;
+    }
+    if (!strcmp(name, "vkCmdDraw")) {
+        if (!real_cmd_draw) { real_cmd_draw = (PFN_vkCmdDraw)p; LOGI("intercept vkCmdDraw"); }
+        return (PFN_vkVoidFunction)ys_vkCmdDraw;
+    }
     if (!strcmp(name, "vkCreateShaderModule")) {
         if (!real_create_shader) { real_create_shader = (PFN_vkCreateShaderModule)p; LOGI("intercept vkCreateShaderModule"); }
         return (PFN_vkVoidFunction)ys_vkCreateShaderModule;
@@ -920,6 +987,14 @@ extern "C" PFN_vkVoidFunction ys_vkGetInstanceProcAddr(VkInstance inst, const ch
     if (!strcmp(name, "vkCreateBuffer")) {
         if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCreateBuffer;
+    }
+    if (!strcmp(name, "vkCreateGraphicsPipelines")) {
+        if (!real_create_gpipe) { real_create_gpipe = (PFN_vkCreateGraphicsPipelines)p; LOGI("intercept vkCreateGraphicsPipelines"); }
+        return (PFN_vkVoidFunction)ys_vkCreateGraphicsPipelines;
+    }
+    if (!strcmp(name, "vkCmdDraw")) {
+        if (!real_cmd_draw) { real_cmd_draw = (PFN_vkCmdDraw)p; LOGI("intercept vkCmdDraw"); }
+        return (PFN_vkVoidFunction)ys_vkCmdDraw;
     }
     if (!strcmp(name, "vkCreateShaderModule")) {
         if (!real_create_shader) { real_create_shader = (PFN_vkCreateShaderModule)p; LOGI("intercept vkCreateShaderModule"); }
@@ -1039,6 +1114,10 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "verbose=", 8)) g_cfg_verbose = atoi(line + 8);
                 else if (!strncmp(line, "dump=", 5)) g_cfg_dump = atoi(line + 5);
                 else if (!strncmp(line, "enable=", 7)) g_cfg_enable = atoi(line + 7);
+                else if (!strncmp(line, "copypos=", 8)) g_copy_pos = atoi(line + 8);
+                else if (!strncmp(line, "copyuv=", 7)) g_copy_uv = atoi(line + 7);
+                else if (!strncmp(line, "copyib=", 7)) g_copy_ib = atoi(line + 7);
+                else if (!strncmp(line, "copyblend=", 10)) g_copy_blend = atoi(line + 10);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
