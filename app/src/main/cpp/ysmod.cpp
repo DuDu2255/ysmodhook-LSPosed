@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.0-lsp"
+#define YSMOD_VER "v2.1-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -383,6 +383,9 @@ static void list_bufs(void) {
 }
 
 // 探针：把 binding0 的所有顶点 x 坐标 +0.5，看模型会不会整体平移
+static uint8_t *g_probe_base = nullptr;
+static size_t   g_probe_sz = 0;
+
 static void probe_vb0(VkCommandBuffer cb) {
     VbRec *r = vbrec_get(cb, 0);
     if (!r || !r->buf[0] || !p_map) return;
@@ -391,13 +394,22 @@ static void probe_vb0(VkCommandBuffer cb) {
     void *p = nullptr;
     if (p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) return;
     invalidate_mem(be->dev, be->mem, be->off, be->size);
+    if (!g_probe_base || g_probe_sz != (size_t)be->size) {
+        free(g_probe_base);
+        g_probe_base = (uint8_t *)malloc((size_t)be->size);
+        if (!g_probe_base) { if (p_unmap) p_unmap(be->dev, be->mem); return; }
+        memcpy(g_probe_base, p, (size_t)be->size);
+        g_probe_sz = (size_t)be->size;
+        LOGI("probe baseline %zu bytes", g_probe_sz);
+    }
+    memcpy(p, g_probe_base, g_probe_sz);          // 每帧从基准恢复，避免累加
     float *f = (float *)((uint8_t *)p + r->off[0]);
     size_t n = (size_t)((be->size - r->off[0]) / 40);
-    LOGI("probe vb0 n=%zu v0=(%.3f %.3f %.3f)", n, f[0], f[1], f[2]);
-    for (size_t i = 0; i < n; i++) f[i * 10] += 0.5f;
+    for (size_t i = 0; i < n; i++) f[i * 10] += 10.0f;
     flush_mem(be->dev, be->mem, be->off, be->size);
     if (p_unmap) p_unmap(be->dev, be->mem);
-    LOGI("probe vb0 shifted +0.5");
+    static int lg = 0;
+    if (!lg) { lg = 1; LOGI("probe vb0 shifted +10.0 (n=%zu)", n); }
 }
 
 // 导出当前 draw 绑定的所有顶点缓冲，用于离线分析真实布局
@@ -531,7 +543,8 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
                     if (g_enabled && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
-                        if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); list_bufs(); if (g_cfg_probe) probe_vb0(cb); }
+                        if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); list_bufs(); }
+                        if (g_cfg_probe) probe_vb0(cb);
                         int part = -1;
                         for (int pi = 0; pi < 3; pi++)
                             if (firstIndex == PART_FIRST[pi] && indexCount == PART_COUNT[pi]) part = pi;
