@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v1.8-lsp"
+#define YSMOD_VER "v1.9-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -24,6 +24,7 @@ static int  g_cfg_ib = 1;      // 替换索引缓冲
 static int  g_cfg_vb = 1;      // 替换顶点缓冲
 static int  g_enabled = 1;     // 模块开关（设置界面）
 static int  g_ib_size = 147630; // 目标合并索引缓冲大小，0 = 不限制
+static int  g_cfg_probe = 0;   // 1 = 把 binding0 的 x 全体 +0.5，用于确认它是不是真位置数据
 
 // ── mod 资源 ──────────────────────────────────────────────────────
 static uint32_t *g_ib_mod[3] = {nullptr, nullptr, nullptr};   // head/body/dress
@@ -354,10 +355,37 @@ struct MappedRange {
 };
 static int g_cfg_flush = 1;
 
+typedef int (*PFN_vkInvalidateMappedMemoryRanges)(VkDevice, uint32_t, const void *);
+static PFN_vkInvalidateMappedMemoryRanges p_inval = nullptr;
+
+static void invalidate_mem(VkDevice dev, VkDeviceMemory mem, VkDeviceSize off, VkDeviceSize size) {
+    if (!p_inval || !mem) return;
+    MappedRange r{6, nullptr, mem, off, size};
+    p_inval(dev, 1, &r);
+}
+
 static void flush_mem(VkDevice dev, VkDeviceMemory mem, VkDeviceSize off, VkDeviceSize size) {
     if (!g_cfg_flush || !p_flush || !mem) return;
     MappedRange r{6, nullptr, mem, off, size};
     p_flush(dev, 1, &r);
+}
+
+// 探针：把 binding0 的所有顶点 x 坐标 +0.5，看模型会不会整体平移
+static void probe_vb0(VkCommandBuffer cb) {
+    VbRec *r = vbrec_get(cb, 0);
+    if (!r || !r->buf[0] || !p_map) return;
+    BufEnt *be = lookup_buf(r->buf[0]);
+    if (!be || !be->mem) return;
+    void *p = nullptr;
+    if (p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) return;
+    invalidate_mem(be->dev, be->mem, be->off, be->size);
+    float *f = (float *)((uint8_t *)p + r->off[0]);
+    size_t n = (size_t)((be->size - r->off[0]) / 40);
+    LOGI("probe vb0 n=%zu v0=(%.3f %.3f %.3f)", n, f[0], f[1], f[2]);
+    for (size_t i = 0; i < n; i++) f[i * 10] += 0.5f;
+    flush_mem(be->dev, be->mem, be->off, be->size);
+    if (p_unmap) p_unmap(be->dev, be->mem);
+    LOGI("probe vb0 shifted +0.5");
 }
 
 // 导出当前 draw 绑定的所有顶点缓冲，用于离线分析真实布局
@@ -372,6 +400,7 @@ static void dump_vbs(VkCommandBuffer cb) {
         LOGI("vb%d size=%llu off=%llu", i, (unsigned long long)be->size, (unsigned long long)r->off[i]);
         void *p = nullptr;
         if (!p_map || p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) { LOGE("vb%d map fail", i); continue; }
+        invalidate_mem(be->dev, be->mem, be->off, be->size);
         size_t n = (size_t)be->size;
         if (n > (2u << 20)) n = 2u << 20;
         char path[400];
@@ -490,7 +519,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
                     if (g_enabled && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
-                        if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); }
+                        if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); if (g_cfg_probe) probe_vb0(cb); }
                         int part = -1;
                         for (int pi = 0; pi < 3; pi++)
                             if (firstIndex == PART_FIRST[pi] && indexCount == PART_COUNT[pi]) part = pi;
@@ -543,6 +572,7 @@ extern "C" PFN_vkVoidFunction ys_vkGetDeviceProcAddr(VkDevice dev, const char *n
         return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers2;
     }
     if (!strcmp(name, "vkFlushMappedMemoryRanges")) { if (!p_flush) p_flush = (PFN_vkFlushMappedMemoryRanges)p; return p; }
+    if (!strcmp(name, "vkInvalidateMappedMemoryRanges")) { if (!p_inval) p_inval = (PFN_vkInvalidateMappedMemoryRanges)p; return p; }
     if (!strcmp(name, "vkMapMemory"))   { if (!p_map)   p_map   = (PFN_vkMapMemory)p;   return p; }
     if (!strcmp(name, "vkUnmapMemory")) { if (!p_unmap) p_unmap = (PFN_vkUnmapMemory)p; return p; }
     return p;
@@ -579,6 +609,7 @@ extern "C" PFN_vkVoidFunction ys_vkGetInstanceProcAddr(VkInstance inst, const ch
         return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers2;
     }
     if (!strcmp(name, "vkFlushMappedMemoryRanges")) { if (!p_flush) p_flush = (PFN_vkFlushMappedMemoryRanges)p; return p; }
+    if (!strcmp(name, "vkInvalidateMappedMemoryRanges")) { if (!p_inval) p_inval = (PFN_vkInvalidateMappedMemoryRanges)p; return p; }
     if (!strcmp(name, "vkMapMemory"))   { if (!p_map)   p_map   = (PFN_vkMapMemory)p;   return p; }
     if (!strcmp(name, "vkUnmapMemory")) { if (!p_unmap) p_unmap = (PFN_vkUnmapMemory)p; return p; }
     return p;
@@ -644,6 +675,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "vb=", 3)) g_cfg_vb = atoi(line + 3);
                 else if (!strncmp(line, "flush=", 6)) g_cfg_flush = atoi(line + 6);
                 else if (!strncmp(line, "ibsize=", 7)) g_ib_size = atoi(line + 7);
+                else if (!strncmp(line, "probe=", 6)) g_cfg_probe = atoi(line + 6);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
