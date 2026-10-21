@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v1.9-lsp"
+#define YSMOD_VER "v2.0-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -370,6 +370,18 @@ static void flush_mem(VkDevice dev, VkDeviceMemory mem, VkDeviceSize off, VkDevi
     p_flush(dev, 1, &r);
 }
 
+// 列出所有跟踪到的大缓冲，便于找真正的顶点数据
+static void list_bufs(void) {
+    int shown = 0;
+    for (int i = 0; i < g_bufent_n && shown < 40; i++) {
+        BufEnt *b = &g_bufent[i];
+        if (!b->mem || b->size < 200000 || b->size > 2000000) continue;
+        LOGI("buf[%d] size=%llu", i, (unsigned long long)b->size);
+        shown++;
+    }
+    LOGI("bufs total=%d", g_bufent_n);
+}
+
 // 探针：把 binding0 的所有顶点 x 坐标 +0.5，看模型会不会整体平移
 static void probe_vb0(VkCommandBuffer cb) {
     VbRec *r = vbrec_get(cb, 0);
@@ -519,7 +531,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
                     if (g_enabled && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
-                        if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); if (g_cfg_probe) probe_vb0(cb); }
+                        if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); list_bufs(); if (g_cfg_probe) probe_vb0(cb); }
                         int part = -1;
                         for (int pi = 0; pi < 3; pi++)
                             if (firstIndex == PART_FIRST[pi] && indexCount == PART_COUNT[pi]) part = pi;
