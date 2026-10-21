@@ -40,10 +40,9 @@ public class Entry implements IXposedHookLoadPackage {
                 try {
                     System.load(f.getAbsolutePath());
                     Log.i(TAG, "loaded ok, calling start()");
-                    String dataDir = null;
-                    if (lpparam.appInfo instanceof android.content.pm.ApplicationInfo)
-                        dataDir = ((android.content.pm.ApplicationInfo) lpparam.appInfo).dataDir;
-                    String out = (dataDir != null) ? dataDir + "/files" : "/data/local/tmp";
+                    // 不能读 lpparam.appInfo：LSPosed 混淆后字段类型与编译桩不一致会抛 NoSuchFieldError。
+                    // 目标包名固定，直接用自身数据目录。
+                    String out = "/data/data/" + TARGET + "/files";
                     new File(out).mkdirs();
                     start(out);
                     return;
