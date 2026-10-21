@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.5-lsp"
+#define YSMOD_VER "v3.6-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -685,7 +685,8 @@ static VkBuffer make_buf(VkDevice dev, const void *data, size_t size) {
 static VkBuffer make_stage(VkDevice dev, size_t size, void **outptr) {
     *outptr = nullptr;
     if (!real_create_buf || !real_alloc_mem || !real_bind_mem || !real_get_buf_req || !size) return nullptr;
-    BufferCI ci{12, nullptr, 0, (VkDeviceSize)size, 0x1 | 0x80 | 0x40, 0, 0, nullptr};
+    // 必须带 TRANSFER_DST(0x2)，否则 vkCmdCopyBuffer 写进来是非法的，驱动会直接丢掉
+    BufferCI ci{12, nullptr, 0, (VkDeviceSize)size, 0x1 | 0x2 | 0x80 | 0x40, 0, 0, nullptr};
     VkBuffer b = nullptr;
     if (real_create_buf(dev, &ci, nullptr, &b) != 0 || !b) { LOGE("stage create fail"); return nullptr; }
     MemReqs rq{};
