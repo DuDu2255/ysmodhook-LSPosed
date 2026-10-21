@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v1.6-lsp"
+#define YSMOD_VER "v1.7-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -358,6 +358,30 @@ static void flush_mem(VkDevice dev, VkDeviceMemory mem, VkDeviceSize off, VkDevi
     p_flush(dev, 1, &r);
 }
 
+// 导出当前 draw 绑定的所有顶点缓冲，用于离线分析真实布局
+static void dump_vbs(VkCommandBuffer cb) {
+    VbRec *r = vbrec_get(cb, 0);
+    if (!r) { LOGE("dump_vbs: no rec"); return; }
+    LOGI("dump_vbs used=0x%x", r->used);
+    for (int i = 0; i < 8; i++) {
+        if (!(r->used & (1 << i)) || !r->buf[i]) continue;
+        BufEnt *be = lookup_buf(r->buf[i]);
+        if (!be || !be->mem) { LOGI("vb%d no ent", i); continue; }
+        LOGI("vb%d size=%llu off=%llu", i, (unsigned long long)be->size, (unsigned long long)r->off[i]);
+        void *p = nullptr;
+        if (!p_map || p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) { LOGE("vb%d map fail", i); continue; }
+        size_t n = (size_t)be->size;
+        if (n > (2u << 20)) n = 2u << 20;
+        char path[400];
+        snprintf(path, sizeof(path), "%s/vb_%d_%llu_%llu.bin", g_outdir, i,
+                 (unsigned long long)be->size, (unsigned long long)r->off[i]);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(p, 1, n, f); fclose(f); LOGI("dumped %s (%zu)", path, n); }
+        else LOGE("dump fail %s", path);
+        if (p_unmap) p_unmap(be->dev, be->mem);
+    }
+}
+
 // 把一个部件的 mod 数据写进游戏正在用的缓冲（就地替换）
 static void replace_part(VkCommandBuffer cb, int part, const uint8_t *base, const IbBind *ib, BufEnt *ie) {
     if (g_cfg_vb && g_vb_ready) {
@@ -463,6 +487,8 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     }
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
                     if (n == 147630) {
+                        static int dumped = 0;
+                        if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); }
                         int part = -1;
                         for (int pi = 0; pi < 3; pi++)
                             if (firstIndex == PART_FIRST[pi] && indexCount == PART_COUNT[pi]) part = pi;
@@ -503,8 +529,9 @@ extern "C" PFN_vkVoidFunction ys_vkGetDeviceProcAddr(VkDevice dev, const char *n
         if (!real_bind_vb) { real_bind_vb = (PFN_vkCmdBindVertexBuffers)p; LOGI("intercept vkCmdBindVertexBuffers"); }
         return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers;
     }
-    if (!strcmp(name, "vkCmdBindVertexBuffers2")) {
-        if (!real_bind_vb2) { real_bind_vb2 = (PFN_vkCmdBindVertexBuffers2)p; LOGI("intercept vkCmdBindVertexBuffers2"); }
+    if (!strcmp(name, "vkCmdBindVertexBuffers2") || !strcmp(name, "vkCmdBindVertexBuffers2EXT") ||
+        !strcmp(name, "vkCmdBindVertexBuffers2KHR")) {
+        if (!real_bind_vb2) { real_bind_vb2 = (PFN_vkCmdBindVertexBuffers2)p; LOGI("intercept %s", name); }
         return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers2;
     }
     if (!strcmp(name, "vkFlushMappedMemoryRanges")) { if (!p_flush) p_flush = (PFN_vkFlushMappedMemoryRanges)p; return p; }
@@ -538,8 +565,9 @@ extern "C" PFN_vkVoidFunction ys_vkGetInstanceProcAddr(VkInstance inst, const ch
         if (!real_bind_vb) { real_bind_vb = (PFN_vkCmdBindVertexBuffers)p; LOGI("intercept vkCmdBindVertexBuffers"); }
         return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers;
     }
-    if (!strcmp(name, "vkCmdBindVertexBuffers2")) {
-        if (!real_bind_vb2) { real_bind_vb2 = (PFN_vkCmdBindVertexBuffers2)p; LOGI("intercept vkCmdBindVertexBuffers2"); }
+    if (!strcmp(name, "vkCmdBindVertexBuffers2") || !strcmp(name, "vkCmdBindVertexBuffers2EXT") ||
+        !strcmp(name, "vkCmdBindVertexBuffers2KHR")) {
+        if (!real_bind_vb2) { real_bind_vb2 = (PFN_vkCmdBindVertexBuffers2)p; LOGI("intercept %s", name); }
         return (PFN_vkVoidFunction)ys_vkCmdBindVertexBuffers2;
     }
     if (!strcmp(name, "vkFlushMappedMemoryRanges")) { if (!p_flush) p_flush = (PFN_vkFlushMappedMemoryRanges)p; return p; }
