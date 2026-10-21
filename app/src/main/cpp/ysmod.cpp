@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.5-lsp"
+#define YSMOD_VER "v2.6-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -27,6 +27,7 @@ static int  g_ib_size = 147630; // 目标合并索引缓冲大小，0 = 不限�
 static int  g_cfg_probe = 0;   // 1 = 位置探针，2 = UV 探针
 static int  g_cfg_verbose = 0; // 1 = 输出每个缓冲的 hash 日志
 static int  g_cfg_dump = 0;    // 1 = 导出顶点/权重缓冲供离线分析
+static int  g_cfg_enable = 1;  // 配置文件里的总开关（设置界面的开关失效时用）
 
 // ── mod 资源 ──────────────────────────────────────────────────────
 static uint32_t *g_ib_mod[3] = {nullptr, nullptr, nullptr};   // head/body/dress
@@ -565,10 +566,16 @@ static bool gpu_replace(VkCommandBuffer cb, int part, const IbBind *ib, VkDevice
             }
         }
         if (tgt) {
-            CopyRegion rb{0, toff, (VkDeviceSize)g_vb_blend_sz};
-            real_copy_buf(cb, g_buf_blend, tgt, 1, &rb);
+            // 同尺寸的缓冲可能有多份，全部写一遍
+            int cnt = 0;
+            for (int i = 0; i < g_bufent_n && cnt < 8; i++) {
+                if (!g_bufent[i].mem || g_bufent[i].size != (VkDeviceSize)g_blend_size) continue;
+                CopyRegion rb{0, g_bufent[i].off, (VkDeviceSize)g_vb_blend_sz};
+                real_copy_buf(cb, g_buf_blend, g_bufent[i].buf, 1, &rb);
+                cnt++;
+            }
             static int lg = 0;
-            if (!lg) { lg = 1; LOGI("blend replaced -> buf size=%d", g_blend_size); }
+            if (!lg) { lg = 1; LOGI("blend replaced -> %d buffer(s) of size %d", cnt, g_blend_size); }
         }
     }
     static int lg = 0;
@@ -705,7 +712,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                         indexCount = 0;
                     }
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
-                    if (g_enabled && (g_ib_size == 0 || (int)n == g_ib_size)) {
+                    if (g_enabled && g_cfg_enable && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
                         if (!dumped && firstIndex == 71181 && g_cfg_dump) { dumped = 1; dump_vbs(cb); list_bufs(); }
                         if (g_cfg_probe == 1) probe_shift(cb, 0, 40, 3, 10.0f);   // 位置 +10
@@ -906,6 +913,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "blendsize=", 10)) g_blend_size = atoi(line + 10);
                 else if (!strncmp(line, "verbose=", 8)) g_cfg_verbose = atoi(line + 8);
                 else if (!strncmp(line, "dump=", 5)) g_cfg_dump = atoi(line + 5);
+                else if (!strncmp(line, "enable=", 7)) g_cfg_enable = atoi(line + 7);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
