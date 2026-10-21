@@ -40,8 +40,10 @@ public class Entry implements IXposedHookLoadPackage {
                 try {
                     System.load(f.getAbsolutePath());
                     Log.i(TAG, "loaded ok, calling start()");
-                    String out = (lpparam.appInfo != null && lpparam.appInfo.dataDir != null)
-                            ? lpparam.appInfo.dataDir + "/files" : "/data/local/tmp";
+                    String dataDir = null;
+                    if (lpparam.appInfo instanceof android.content.pm.ApplicationInfo)
+                        dataDir = ((android.content.pm.ApplicationInfo) lpparam.appInfo).dataDir;
+                    String out = (dataDir != null) ? dataDir + "/files" : "/data/local/tmp";
                     new File(out).mkdirs();
                     start(out);
                     return;
