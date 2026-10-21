@@ -692,8 +692,9 @@ static VkBuffer make_buf(VkDevice dev, const void *data, size_t size) {
 }
 
 // 分配一块 host 可见、常驻映射的暂存缓冲（用于 GPU→CPU 回读）
-static VkBuffer make_stage(VkDevice dev, size_t size, void **outptr) {
+static VkBuffer make_stage(VkDevice dev, size_t size, void **outptr, VkDeviceMemory *outmem) {
     *outptr = nullptr;
+    if (outmem) *outmem = nullptr;
     if (!real_create_buf || !real_alloc_mem || !real_bind_mem || !real_get_buf_req || !size) return nullptr;
     // 必须带 TRANSFER_DST(0x2)，否则 vkCmdCopyBuffer 写进来是非法的，驱动会直接丢掉
     BufferCI ci{12, nullptr, 0, (VkDeviceSize)size, 0x1 | 0x2 | 0x80 | 0x40, 0, 0, nullptr};
@@ -712,6 +713,7 @@ static VkBuffer make_stage(VkDevice dev, size_t size, void **outptr) {
     memset(pp, 0, (size_t)rq.size);
     flush_mem(dev, m, 0, rq.size);
     *outptr = pp;
+    if (outmem) *outmem = m;
     g_stage_mem = m;
     g_stage_sz = rq.size;
     LOGI("stage buffer %p ptr=%p size=%llu", (void *)b, pp, (unsigned long long)rq.size);
@@ -1058,9 +1060,8 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                                 }
                                 if (g_bm_cursor < g_bufent_n) {
                                     BufEnt *t = &g_bufent[g_bm_cursor];
-                                    g_bm_buf = make_stage(dv, (size_t)t->size, &g_bm_ptr);
+                                    g_bm_buf = make_stage(dv, (size_t)t->size, &g_bm_ptr, &g_bm_mem);
                                     if (g_bm_buf && g_bm_ptr) {
-                                        g_bm_mem = g_stage_mem;   // make_stage 内部写入
                                         g_bm_sz = t->size;
                                         g_bm_idx = g_bm_cursor;
                                         CopyRegion cr{0, 0, t->size};
@@ -1088,7 +1089,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                         BufEnt *ve = (vr && vr->buf[0]) ? lookup_buf(vr->buf[0]) : nullptr;
                         if (ve && ve->size) {
                             if (g_stage_state == 0) {
-                                if (!g_stage_buf) g_stage_buf = make_stage(ve->dev, (size_t)ve->size, &g_stage_ptr);
+                                if (!g_stage_buf) g_stage_buf = make_stage(ve->dev, (size_t)ve->size, &g_stage_ptr, &g_stage_mem);
                                 if (g_stage_buf && g_stage_ptr) {
                                     VkDeviceSize nn = ve->size < g_stage_sz ? ve->size : g_stage_sz;
                                     CopyRegion cr{0, 0, nn};
