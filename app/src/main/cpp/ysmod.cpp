@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.9-lsp"
+#define YSMOD_VER "v3.0-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -612,7 +612,9 @@ struct CopyRegion { VkDeviceSize srcOffset, dstOffset, size; };
 static int g_cfg_mode = 2;   // 1 = CPU 直写（会闪），2 = GPU 拷贝
 static int g_copy_pos = 1, g_copy_uv = 1, g_copy_ib = 1, g_copy_blend = 1;
 static int g_cfg_wprobe = 0;   // 1 = 权重全写成「100% 骨骼0」，验证缓冲是否被使用
+static int g_cfg_posprobe = 0; // 1 = 位置全写成同一点，验证位置缓冲是否被使用
 static VkBuffer g_buf_wconst = nullptr;
+static VkBuffer g_buf_pconst = nullptr;
 
 static int find_mem_type(uint32_t bits) {
     if (!g_phys || !real_get_mem_props) return -1;
@@ -682,9 +684,28 @@ static bool gpu_replace(VkCommandBuffer cb, int part, const IbBind *ib, VkDevice
     ensure_mod_buffers(dev);
     VbRec *r = vbrec_get(cb, 0);
     CopyRegion rg{};
-    if (g_copy_pos && g_buf_pos && r && r->buf[0]) {
-        rg = CopyRegion{0, r->off[0], (VkDeviceSize)g_vb_pos_sz};
-        real_copy_buf(cb, g_buf_pos, r->buf[0], 1, &rg);
+    if (g_copy_pos && r && r->buf[0]) {
+        VkBuffer srcp = g_buf_pos;
+        if (g_cfg_posprobe) {
+            if (!g_buf_pconst && g_vb_pos_sz) {
+                uint8_t *tmp = (uint8_t *)calloc(1, g_vb_pos_sz);
+                if (tmp) {
+                    for (size_t o = 0; o + 40 <= g_vb_pos_sz; o += 40) {
+                        float *f = (float *)(tmp + o);
+                        f[0] = 0.f; f[1] = 1.0f; f[2] = 0.f;   // 全部塌到 (0,1,0)
+                        f[3] = 0.f; f[4] = 1.f; f[5] = 0.f;   // 法线朝上
+                        f[9] = 1.f;
+                    }
+                    g_buf_pconst = make_buf(dev, tmp, g_vb_pos_sz);
+                    free(tmp);
+                }
+            }
+            if (g_buf_pconst) srcp = g_buf_pconst;
+        }
+        if (srcp) {
+            rg = CopyRegion{0, r->off[0], (VkDeviceSize)g_vb_pos_sz};
+            real_copy_buf(cb, srcp, r->buf[0], 1, &rg);
+        }
     }
     if (g_copy_uv && g_buf_uv && r && r->buf[1]) {
         rg = CopyRegion{0, r->off[1], (VkDeviceSize)g_vb_uv_sz};
@@ -1135,6 +1156,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "copyib=", 7)) g_copy_ib = atoi(line + 7);
                 else if (!strncmp(line, "copyblend=", 10)) g_copy_blend = atoi(line + 10);
                 else if (!strncmp(line, "wprobe=", 7)) g_cfg_wprobe = atoi(line + 7);
+                else if (!strncmp(line, "posprobe=", 9)) g_cfg_posprobe = atoi(line + 9);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
