@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.6-lsp"
+#define YSMOD_VER "v3.7-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -643,6 +643,16 @@ static VkDeviceSize g_stage_sz = 0;
 static VkDeviceMemory g_stage_mem = nullptr;
 static int        g_stage_state = 0;   // 0=未开始 1=已记录拷贝 2=已读回
 
+// ── 批量回读：逐个缓冲 GPU 拷贝 -> 落盘（找骨骼矩阵用）──────────
+static int        g_cfg_bmdump = 0;
+static int        g_bm_cursor  = 0;
+static int        g_bm_state   = 0;
+static VkBuffer   g_bm_buf     = nullptr;
+static void      *g_bm_ptr     = nullptr;
+static VkDeviceMemory g_bm_mem = nullptr;
+static VkDeviceSize   g_bm_sz  = 0;
+static int        g_bm_idx     = -1;
+
 static int find_mem_type(uint32_t bits) {
     if (!g_phys || !real_get_mem_props) return -1;
     MemProps mp{};
@@ -1034,6 +1044,44 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                 size_t start = (size_t)ib->off + (size_t)firstIndex * esz;
                 size_t len   = (size_t)indexCount * esz;
                 if (start + len <= n) {
+                    // —— 批量回读：每帧拷一个缓冲，下一帧落盘 ——
+                    if (g_cfg_bmdump) {
+                        VbRec *vr3 = vbrec_get(cb, 0);
+                        BufEnt *ve3 = (vr3 && vr3->buf[0]) ? lookup_buf(vr3->buf[0]) : nullptr;
+                        VkDevice dv = ve3 ? ve3->dev : nullptr;
+                        if (dv) {
+                            if (g_bm_state == 0) {
+                                while (g_bm_cursor < g_bufent_n) {
+                                    BufEnt *t = &g_bufent[g_bm_cursor];
+                                    if (t->mem && t->size >= 2048 && t->size <= 65536 && t->dev == dv) break;
+                                    g_bm_cursor++;
+                                }
+                                if (g_bm_cursor < g_bufent_n) {
+                                    BufEnt *t = &g_bufent[g_bm_cursor];
+                                    g_bm_buf = make_stage(dv, (size_t)t->size, &g_bm_ptr);
+                                    if (g_bm_buf && g_bm_ptr) {
+                                        g_bm_mem = g_stage_mem;   // make_stage 内部写入
+                                        g_bm_sz = t->size;
+                                        g_bm_idx = g_bm_cursor;
+                                        CopyRegion cr{0, 0, t->size};
+                                        real_copy_buf(cb, t->buf, g_bm_buf, 1, &cr);
+                                        g_bm_state = 1;
+                                    } else { g_bm_cursor++; }
+                                }
+                            } else if (g_bm_state == 1) {
+                                invalidate_mem(dv, g_bm_mem, 0, g_bm_sz);
+                                char path[400];
+                                snprintf(path, sizeof(path), "%s/bm_%d_%llu.bin", g_outdir, g_bm_idx,
+                                         (unsigned long long)g_bm_sz);
+                                FILE *f = fopen(path, "wb");
+                                if (f) { fwrite(g_bm_ptr, 1, (size_t)g_bm_sz, f); fclose(f); }
+                                LOGI("bmdump: %s (%llu)", path, (unsigned long long)g_bm_sz);
+                                g_bm_cursor++;
+                                g_bm_state = 0;
+                                g_bm_buf = nullptr; g_bm_ptr = nullptr; g_bm_mem = nullptr;
+                            }
+                        }
+                    }
                     // —— 原版顶点缓冲回读：录一次 GPU 拷贝，下一帧读回落盘 ——
                     if (g_cfg_vbdump) {
                         VbRec *vr = vbrec_get(cb, 0);
@@ -1072,7 +1120,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                         indexCount = 0;
                     }
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
-                    if (g_enabled && g_cfg_enable && !g_cfg_vbdump && (g_ib_size == 0 || (int)n == g_ib_size)) {
+                    if (g_enabled && g_cfg_enable && !g_cfg_vbdump && !g_cfg_bmdump && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
                         if (!dumped && firstIndex == 71181 && g_cfg_dump) { dumped = 1; dump_vbs(cb); list_bufs(); dump_ubo(cb); dump_small_bufs(); }
                         if (g_cfg_probe == 1) probe_shift(cb, 0, 40, 3, 10.0f);   // 位置 +10
@@ -1358,6 +1406,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "wprobe=", 7)) g_cfg_wprobe = atoi(line + 7);
                 else if (!strncmp(line, "posprobe=", 9)) g_cfg_posprobe = atoi(line + 9);
                 else if (!strncmp(line, "vbdump=", 7)) g_cfg_vbdump = atoi(line + 7);
+                else if (!strncmp(line, "bmdump=", 7)) g_cfg_bmdump = atoi(line + 7);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
