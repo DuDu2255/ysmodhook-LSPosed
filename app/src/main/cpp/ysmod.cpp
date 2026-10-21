@@ -15,7 +15,9 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v1.0-lsp"
+#define YSMOD_VER "v1.1-lsp"
+
+static char g_outdir[256] = {0};
 
 typedef struct VkDevice_T        *VkDevice;
 typedef struct VkInstance_T      *VkInstance;
@@ -229,6 +231,20 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     e->hashed2 = 1;
                     uint32_t d = fnv_expand(base, n / esz, esz, 0x811C9DC5u);
                     LOGI("[D] %08x idxs=%zu size=%llu esz=%u", d, n / esz, (unsigned long long)n, esz);
+                    // dump 大索引缓冲，供离线分析 hash
+                    if (g_outdir[0] && n >= 100000 && n <= 300000) {
+                        char path[320];
+                        snprintf(path, sizeof(path), "%s/ib_%llu_%u.bin", g_outdir,
+                                 (unsigned long long)n, esz);
+                        FILE *fp = fopen(path, "wb");
+                        if (fp) {
+                            fwrite(base, 1, n, fp);
+                            fclose(fp);
+                            LOGI("dumped %s", path);
+                        } else {
+                            LOGE("dump fail %s", path);
+                        }
+                    }
                 }
 
                 size_t start = (size_t)ib->off + (size_t)firstIndex * esz;
@@ -339,9 +355,15 @@ static void *worker(void *) {
 
 // ─── JNI 入口：由 LSPosed 模块在目标进程里调用 ───
 extern "C" JNIEXPORT void JNICALL
-Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz) {
-    (void)env; (void)clazz;
-    LOGI("%s starting (pid=%d)", YSMOD_VER, getpid());
+Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir) {
+    if (outDir) {
+        const char *s = env->GetStringUTFChars(outDir, nullptr);
+        if (s) {
+            strncpy(g_outdir, s, sizeof(g_outdir) - 1);
+            env->ReleaseStringUTFChars(outDir, s);
+        }
+    }
+    LOGI("%s starting (pid=%d) outdir=%s", YSMOD_VER, getpid(), g_outdir);
     pthread_t t;
     if (pthread_create(&t, nullptr, worker, nullptr) == 0) pthread_detach(t);
 }

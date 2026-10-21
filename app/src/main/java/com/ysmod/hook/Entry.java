@@ -19,7 +19,7 @@ public class Entry implements IXposedHookLoadPackage {
     private static final String TARGET = "com.miHoYo.Yuanshen";
     private static final String SELF = "com.ysmod.hook";
 
-    private static native void start();
+    private static native void start(String outDir);
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
@@ -40,7 +40,10 @@ public class Entry implements IXposedHookLoadPackage {
                 try {
                     System.load(f.getAbsolutePath());
                     Log.i(TAG, "loaded ok, calling start()");
-                    start();
+                    String out = (lpparam.appInfo != null && lpparam.appInfo.dataDir != null)
+                            ? lpparam.appInfo.dataDir + "/files" : "/data/local/tmp";
+                    new File(out).mkdirs();
+                    start(out);
                     return;
                 } catch (Throwable t) {
                     Log.e(TAG, "load/start failed: " + t);
