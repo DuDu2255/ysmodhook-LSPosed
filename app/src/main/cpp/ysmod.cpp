@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v1.5-lsp"
+#define YSMOD_VER "v1.6-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -342,9 +342,19 @@ static const uint32_t PART_COUNT[3] = {28278u, 42903u, 2634u};
 typedef int (*PFN_vkFlushMappedMemoryRanges)(VkDevice, uint32_t, const void *);
 static PFN_vkFlushMappedMemoryRanges p_flush = nullptr;
 
+// VkMappedMemoryRange 必须以 sType/pNext 开头（sType = 6），否则驱动读到垃圾指针直接崩
+struct MappedRange {
+    int           sType;
+    const void   *pNext;
+    VkDeviceMemory memory;
+    VkDeviceSize   offset;
+    VkDeviceSize   size;
+};
+static int g_cfg_flush = 1;
+
 static void flush_mem(VkDevice dev, VkDeviceMemory mem, VkDeviceSize off, VkDeviceSize size) {
-    if (!p_flush || !mem) return;
-    struct Range { VkDeviceMemory m; VkDeviceSize o, s; } r{mem, off, size};
+    if (!g_cfg_flush || !p_flush || !mem) return;
+    MappedRange r{6, nullptr, mem, off, size};
     p_flush(dev, 1, &r);
 }
 
@@ -595,6 +605,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir) {
                 if (!strncmp(line, "test=", 5)) g_test_mode = atoi(line + 5);
                 else if (!strncmp(line, "ib=", 3)) g_cfg_ib = atoi(line + 3);
                 else if (!strncmp(line, "vb=", 3)) g_cfg_vb = atoi(line + 3);
+                else if (!strncmp(line, "flush=", 6)) g_cfg_flush = atoi(line + 6);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
