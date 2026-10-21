@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.1-lsp"
+#define YSMOD_VER "v3.2-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -834,14 +834,17 @@ static void dump_ubo(VkCommandBuffer cb) {
         bool bound = false;
         for (int s = 0; s < r->n; s++) if (r->sets[s] && r->sets[s] == g_desc[i].set) bound = true;
         if (!bound) continue;
+        BufEnt *be = lookup_buf(g_desc[i].buf);
+        if (!be || !be->mem || !p_map) continue;
         VkDeviceSize range = g_desc[i].range;
-        if (range < 1024 || range > 131072) continue;
+        if (range == 0 || range == (VkDeviceSize)-1) range = be->size - g_desc[i].off;
+        LOGI("desc b%u range=%llu bufsize=%llu", g_desc[i].binding,
+             (unsigned long long)range, (unsigned long long)be->size);
+        if (range < 256 || range > (1u << 20)) continue;
         bool dup = false;
         for (int k = 0; k < seen_n; k++) if (seen[k] == g_desc[i].buf) dup = true;
         if (dup) continue;
         if (seen_n < 16) seen[seen_n++] = g_desc[i].buf;
-        BufEnt *be = lookup_buf(g_desc[i].buf);
-        if (!be || !be->mem || !p_map) continue;
         void *p = nullptr;
         if (p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) continue;
         invalidate_mem(be->dev, be->mem, be->off, be->size);
