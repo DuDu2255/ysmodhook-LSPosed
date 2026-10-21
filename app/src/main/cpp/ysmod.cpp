@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.6-lsp"
+#define YSMOD_VER "v2.7-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -147,6 +147,27 @@ typedef void (*PFN_vkGetBufferMemoryRequirements)(VkDevice, VkBuffer, void *);
 typedef void (*PFN_vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, void *);
 typedef void (*PFN_vkCmdCopyBuffer)(VkCommandBuffer, VkBuffer, VkBuffer, uint32_t, const void *);
 typedef VkResult (*PFN_vkCreateDevice)(VkPhysicalDevice, const void *, const void *, VkDevice *);
+
+// ── 计算管线追踪（用于定位景深等后处理 pass）──────────────────────
+typedef VkResult (*PFN_vkCreateShaderModule)(VkDevice, const void *, const void *, void **);
+typedef VkResult (*PFN_vkCreateComputePipelines)(VkDevice, void *, uint32_t, const void *, const void *, void **);
+typedef void (*PFN_vkCmdBindPipeline)(VkCommandBuffer, int, void *);
+typedef void (*PFN_vkCmdDispatch)(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
+
+static PFN_vkCreateShaderModule      real_create_shader = nullptr;
+static PFN_vkCreateComputePipelines  real_create_cpipe = nullptr;
+static PFN_vkCmdBindPipeline         real_bind_pipe = nullptr;
+static PFN_vkCmdDispatch             real_dispatch = nullptr;
+
+static uint32_t g_shader_hash[2048];      // shaderModule -> hash
+static int      g_shader_hash_n = 0;
+static uint32_t g_pipe_hash[4096];        // computePipeline -> hash
+static int      g_pipe_hash_n = 0;
+static uint32_t g_cur_cpipe[256];         // commandBuffer -> pipeline hash
+static VkCommandBuffer g_cb_slot[256];
+static uint32_t g_disp_seen[64];          // 已记录过的 hash
+static int      g_disp_seen_n = 0;
+static uint64_t g_disp_count = 0;
 
 static PFN_vkAllocateMemory                real_alloc_mem = nullptr;
 static PFN_vkGetBufferMemoryRequirements   real_get_buf_req = nullptr;
@@ -296,6 +317,78 @@ extern "C" int ys_vkCreateBuffer(VkDevice dev, const void *ci, const void *alloc
         pthread_mutex_unlock(&g_mtx);
     }
     return r;
+}
+
+static void    *g_shader_mod[2048];
+static void    *g_pipe_ptr[4096];
+static int      g_shader_mod_n = 0;
+
+static uint32_t shader_hash_of(void *mod) {
+    for (int i = 0; i < g_shader_mod_n; i++) if (g_shader_mod[i] == mod) return g_shader_hash[i];
+    return 0;
+}
+static uint32_t pipe_hash_of(void *pipe) {
+    for (int i = 0; i < g_pipe_hash_n; i++) if (g_pipe_ptr[i] == pipe) return g_pipe_hash[i];
+    return 0;
+}
+
+extern "C" int ys_vkCreateShaderModule(VkDevice dev, const void *ci, const void *alloc, void **out) {
+    int r = real_create_shader ? real_create_shader(dev, ci, alloc, out) : -1;
+    if (r == 0 && ci && out && *out && g_shader_mod_n < 2048) {
+        uint64_t sz = *(const uint64_t *)((const uint8_t *)ci + 24);
+        const void *code = *(const void *const *)((const uint8_t *)ci + 32);
+        if (code && sz) {
+            g_shader_mod[g_shader_mod_n] = *out;
+            g_shader_hash[g_shader_mod_n] = fnv1a((const uint8_t *)code, (size_t)sz, 0x811C9DC5u);
+            g_shader_mod_n++;
+        }
+    }
+    return r;
+}
+
+extern "C" int ys_vkCreateComputePipelines(VkDevice dev, void *cache, uint32_t count,
+                                           const void *cis, const void *alloc, void **out) {
+    int r = real_create_cpipe ? real_create_cpipe(dev, cache, count, cis, alloc, out) : -1;
+    if (r == 0 && cis && out) {
+        for (uint32_t i = 0; i < count; i++) {
+            const uint8_t *base = (const uint8_t *)cis + (size_t)i * 96;
+            void *mod = *(void *const *)(base + 48);      // stage.module
+            if (out[i] && g_pipe_hash_n < 4096) {
+                g_pipe_ptr[g_pipe_hash_n] = out[i];
+                g_pipe_hash[g_pipe_hash_n] = shader_hash_of(mod);
+                g_pipe_hash_n++;
+            }
+        }
+    }
+    return r;
+}
+
+extern "C" void ys_vkCmdBindPipeline(VkCommandBuffer cb, int bindPoint, void *pipe) {
+    if (bindPoint == 0) {   // VK_PIPELINE_BIND_POINT_COMPUTE
+        int slot = -1, empty = -1;
+        for (int i = 0; i < 256; i++) {
+            if (g_cb_slot[i] == cb) { slot = i; break; }
+            if (!g_cb_slot[i] && empty < 0) empty = i;
+        }
+        if (slot < 0) slot = empty;
+        if (slot >= 0) { g_cb_slot[slot] = cb; g_cur_cpipe[slot] = pipe_hash_of(pipe); }
+    }
+    if (real_bind_pipe) real_bind_pipe(cb, bindPoint, pipe);
+}
+
+extern "C" void ys_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    g_disp_count++;
+    uint32_t h = 0;
+    for (int i = 0; i < 256; i++) if (g_cb_slot[i] == cb) { h = g_cur_cpipe[i]; break; }
+    if (h) {
+        bool seen = false;
+        for (int i = 0; i < g_disp_seen_n; i++) if (g_disp_seen[i] == h) { seen = true; break; }
+        if (!seen && g_disp_seen_n < 64) {
+            g_disp_seen[g_disp_seen_n++] = h;
+            LOGI("compute %08x dims=%ux%ux%u", h, x, y, z);
+        }
+    }
+    if (real_dispatch) real_dispatch(cb, x, y, z);
 }
 
 extern "C" int ys_vkCreateDevice(VkPhysicalDevice phys, const void *ci, const void *alloc, VkDevice *out) {
@@ -760,6 +853,22 @@ extern "C" PFN_vkVoidFunction ys_vkGetDeviceProcAddr(VkDevice dev, const char *n
         if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCreateBuffer;
     }
+    if (!strcmp(name, "vkCreateShaderModule")) {
+        if (!real_create_shader) { real_create_shader = (PFN_vkCreateShaderModule)p; LOGI("intercept vkCreateShaderModule"); }
+        return (PFN_vkVoidFunction)ys_vkCreateShaderModule;
+    }
+    if (!strcmp(name, "vkCreateComputePipelines")) {
+        if (!real_create_cpipe) { real_create_cpipe = (PFN_vkCreateComputePipelines)p; LOGI("intercept vkCreateComputePipelines"); }
+        return (PFN_vkVoidFunction)ys_vkCreateComputePipelines;
+    }
+    if (!strcmp(name, "vkCmdBindPipeline")) {
+        if (!real_bind_pipe) { real_bind_pipe = (PFN_vkCmdBindPipeline)p; LOGI("intercept vkCmdBindPipeline"); }
+        return (PFN_vkVoidFunction)ys_vkCmdBindPipeline;
+    }
+    if (!strcmp(name, "vkCmdDispatch")) {
+        if (!real_dispatch) { real_dispatch = (PFN_vkCmdDispatch)p; LOGI("intercept vkCmdDispatch"); }
+        return (PFN_vkVoidFunction)ys_vkCmdDispatch;
+    }
     if (!strcmp(name, "vkCreateDevice")) {
         if (!real_create_dev) { real_create_dev = (PFN_vkCreateDevice)p; LOGI("intercept vkCreateDevice"); }
         return (PFN_vkVoidFunction)ys_vkCreateDevice;
@@ -811,6 +920,22 @@ extern "C" PFN_vkVoidFunction ys_vkGetInstanceProcAddr(VkInstance inst, const ch
     if (!strcmp(name, "vkCreateBuffer")) {
         if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCreateBuffer;
+    }
+    if (!strcmp(name, "vkCreateShaderModule")) {
+        if (!real_create_shader) { real_create_shader = (PFN_vkCreateShaderModule)p; LOGI("intercept vkCreateShaderModule"); }
+        return (PFN_vkVoidFunction)ys_vkCreateShaderModule;
+    }
+    if (!strcmp(name, "vkCreateComputePipelines")) {
+        if (!real_create_cpipe) { real_create_cpipe = (PFN_vkCreateComputePipelines)p; LOGI("intercept vkCreateComputePipelines"); }
+        return (PFN_vkVoidFunction)ys_vkCreateComputePipelines;
+    }
+    if (!strcmp(name, "vkCmdBindPipeline")) {
+        if (!real_bind_pipe) { real_bind_pipe = (PFN_vkCmdBindPipeline)p; LOGI("intercept vkCmdBindPipeline"); }
+        return (PFN_vkVoidFunction)ys_vkCmdBindPipeline;
+    }
+    if (!strcmp(name, "vkCmdDispatch")) {
+        if (!real_dispatch) { real_dispatch = (PFN_vkCmdDispatch)p; LOGI("intercept vkCmdDispatch"); }
+        return (PFN_vkVoidFunction)ys_vkCmdDispatch;
     }
     if (!strcmp(name, "vkCreateDevice")) {
         if (!real_create_dev) { real_create_dev = (PFN_vkCreateDevice)p; LOGI("intercept vkCreateDevice"); }
