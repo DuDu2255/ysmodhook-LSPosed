@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.1-lsp"
+#define YSMOD_VER "v2.3-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -109,6 +109,7 @@ static int vb_classify(const uint8_t *p, size_t size) {
 }
 
 typedef struct VkDevice_T        *VkDevice;
+typedef struct VkPhysicalDevice_T *VkPhysicalDevice;
 typedef struct VkInstance_T      *VkInstance;
 typedef struct VkCommandBuffer_T *VkCommandBuffer;
 typedef struct VkBuffer_T        *VkBuffer;
@@ -134,8 +135,23 @@ static PFN_vkGetDeviceProcAddr   real_gdpa = nullptr;
 static PFN_vkGetInstanceProcAddr real_gipa = nullptr;
 static PFN_vkCmdDrawIndexed      real_draw_indexed = nullptr;
 static PFN_vkCmdBindIndexBuffer  real_bind_ib = nullptr;
+typedef void (*PFN_vkDestroyBuffer)(VkDevice, VkBuffer, const void *);
+static PFN_vkDestroyBuffer         real_destroy_buf = nullptr;
 static PFN_vkCmdBindVertexBuffers  real_bind_vb = nullptr;
 static PFN_vkCmdBindVertexBuffers2 real_bind_vb2 = nullptr;
+typedef VkResult (*PFN_vkAllocateMemory)(VkDevice, const void *, const void *, VkDeviceMemory *);
+typedef void (*PFN_vkGetBufferMemoryRequirements)(VkDevice, VkBuffer, void *);
+typedef void (*PFN_vkGetPhysicalDeviceMemoryProperties)(VkPhysicalDevice, void *);
+typedef void (*PFN_vkCmdCopyBuffer)(VkCommandBuffer, VkBuffer, VkBuffer, uint32_t, const void *);
+typedef VkResult (*PFN_vkCreateDevice)(VkPhysicalDevice, const void *, const void *, VkDevice *);
+
+static PFN_vkAllocateMemory                real_alloc_mem = nullptr;
+static PFN_vkGetBufferMemoryRequirements   real_get_buf_req = nullptr;
+static PFN_vkGetPhysicalDeviceMemoryProperties real_get_mem_props = nullptr;
+static PFN_vkCmdCopyBuffer                 real_copy_buf = nullptr;
+static PFN_vkCreateDevice                  real_create_dev = nullptr;
+static VkPhysicalDevice                    g_phys = nullptr;
+
 static PFN_vkBindBufferMemory    real_bind_mem = nullptr;
 static PFN_vkCreateBuffer        real_create_buf = nullptr;
 static PFN_vkMapMemory           p_map = nullptr;
@@ -279,6 +295,22 @@ extern "C" int ys_vkCreateBuffer(VkDevice dev, const void *ci, const void *alloc
     return r;
 }
 
+extern "C" int ys_vkCreateDevice(VkPhysicalDevice phys, const void *ci, const void *alloc, VkDevice *out) {
+    g_phys = phys;
+    LOGI("vkCreateDevice phys=%p", (void *)phys);
+    if (!real_create_dev) return -1;
+    return real_create_dev(phys, ci, alloc, out);
+}
+
+extern "C" void ys_vkDestroyBuffer(VkDevice dev, VkBuffer buf, const void *alloc) {
+    pthread_mutex_lock(&g_mtx);
+    for (int i = 0; i < g_bufent_n; i++) {
+        if (g_bufent[i].buf == buf) { g_bufent[i] = g_bufent[--g_bufent_n]; break; }
+    }
+    pthread_mutex_unlock(&g_mtx);
+    if (real_destroy_buf) real_destroy_buf(dev, buf, alloc);
+}
+
 extern "C" void ys_vkBindBufferMemory(VkDevice dev, VkBuffer buf, VkDeviceMemory mem, VkDeviceSize off) {
     pthread_mutex_lock(&g_mtx);
     BufEnt *be = lookup_buf(buf);
@@ -383,33 +415,127 @@ static void list_bufs(void) {
 }
 
 // 探针：把 binding0 的所有顶点 x 坐标 +0.5，看模型会不会整体平移
-static uint8_t *g_probe_base = nullptr;
-static size_t   g_probe_sz = 0;
+static uint8_t *g_base[8] = {nullptr};
+static size_t   g_base_sz[8] = {0};
 
-static void probe_vb0(VkCommandBuffer cb) {
+// 把某个 binding 的顶点属性整体平移，用来确认这条数据通道是否真的被 GPU 使用
+static void probe_shift(VkCommandBuffer cb, int binding, int stride, int ncomp, float delta) {
     VbRec *r = vbrec_get(cb, 0);
-    if (!r || !r->buf[0] || !p_map) return;
-    BufEnt *be = lookup_buf(r->buf[0]);
+    if (!r || binding >= 8 || !r->buf[binding] || !p_map) return;
+    BufEnt *be = lookup_buf(r->buf[binding]);
     if (!be || !be->mem) return;
     void *p = nullptr;
     if (p_map(be->dev, be->mem, be->off, be->size, 0, &p) != 0 || !p) return;
     invalidate_mem(be->dev, be->mem, be->off, be->size);
-    if (!g_probe_base || g_probe_sz != (size_t)be->size) {
-        free(g_probe_base);
-        g_probe_base = (uint8_t *)malloc((size_t)be->size);
-        if (!g_probe_base) { if (p_unmap) p_unmap(be->dev, be->mem); return; }
-        memcpy(g_probe_base, p, (size_t)be->size);
-        g_probe_sz = (size_t)be->size;
-        LOGI("probe baseline %zu bytes", g_probe_sz);
+    if (!g_base[binding] || g_base_sz[binding] != (size_t)be->size) {
+        free(g_base[binding]);
+        g_base[binding] = (uint8_t *)malloc((size_t)be->size);
+        if (!g_base[binding]) { if (p_unmap) p_unmap(be->dev, be->mem); return; }
+        memcpy(g_base[binding], p, (size_t)be->size);
+        g_base_sz[binding] = (size_t)be->size;
+        LOGI("probe base vb%d %zu bytes", binding, g_base_sz[binding]);
     }
-    memcpy(p, g_probe_base, g_probe_sz);          // 每帧从基准恢复，避免累加
-    float *f = (float *)((uint8_t *)p + r->off[0]);
-    size_t n = (size_t)((be->size - r->off[0]) / 40);
-    for (size_t i = 0; i < n; i++) f[i * 10] += 10.0f;
+    memcpy(p, g_base[binding], g_base_sz[binding]);
+    float *f = (float *)((uint8_t *)p + r->off[binding]);
+    size_t n = (size_t)((be->size - r->off[binding]) / stride);
+    for (size_t i = 0; i < n; i++)
+        for (int k = 0; k < ncomp; k++) f[i * (stride / 4) + k] += delta;
     flush_mem(be->dev, be->mem, be->off, be->size);
     if (p_unmap) p_unmap(be->dev, be->mem);
     static int lg = 0;
-    if (!lg) { lg = 1; LOGI("probe vb0 shifted +10.0 (n=%zu)", n); }
+    if (!lg) { lg = 1; LOGI("probe vb%d shifted %+0.2f (n=%zu stride=%d)", binding, delta, n, stride); }
+}
+
+// ── GPU 侧替换：自建缓冲 + vkCmdCopyBuffer ────────────────────────
+struct MemReqs { VkDeviceSize size, alignment; uint32_t memoryTypeBits; };
+struct MemType { int propertyFlags; uint32_t heapIndex; };
+struct MemHeap { VkDeviceSize size; int flags; };
+struct MemProps { uint32_t memoryTypeCount; MemType memoryTypes[32]; uint32_t memoryHeapCount; MemHeap memoryHeaps[16]; };
+struct BufferCI { int sType; const void *pNext; int flags; VkDeviceSize size; int usage; int sharingMode; uint32_t qfCount; const uint32_t *qf; };
+struct AllocInfo { int sType; const void *pNext; VkDeviceSize size; uint32_t memoryTypeIndex; };
+struct CopyRegion { VkDeviceSize srcOffset, dstOffset, size; };
+
+static int g_cfg_mode = 2;   // 1 = CPU 直写（会闪），2 = GPU 拷贝
+
+static int find_mem_type(uint32_t bits) {
+    if (!g_phys || !real_get_mem_props) return -1;
+    MemProps mp{};
+    real_get_mem_props(g_phys, &mp);
+    int fallback = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++) {
+        if (!(bits & (1u << i))) continue;
+        int f = mp.memoryTypes[i].propertyFlags;
+        if ((f & 0x2) && (f & 0x4)) {
+            if (f & 0x1) return (int)i;      // 优先 DEVICE_LOCAL + HOST_VISIBLE
+            if (fallback < 0) fallback = (int)i;
+        }
+    }
+    return fallback;
+}
+
+static VkBuffer make_buf(VkDevice dev, const void *data, size_t size) {
+    if (!real_create_buf || !real_alloc_mem || !real_bind_mem || !real_get_buf_req || !size) return nullptr;
+    BufferCI ci{12, nullptr, 0, (VkDeviceSize)size, 0x1 | 0x80 | 0x40, 0, 0, nullptr};
+    VkBuffer b = nullptr;
+    if (real_create_buf(dev, &ci, nullptr, &b) != 0 || !b) { LOGE("make_buf create fail"); return nullptr; }
+    MemReqs rq{};
+    real_get_buf_req(dev, b, &rq);
+    int mt = find_mem_type(rq.memoryTypeBits);
+    if (mt < 0) { LOGE("make_buf no memtype"); return nullptr; }
+    AllocInfo ai{5, nullptr, rq.size, (uint32_t)mt};
+    VkDeviceMemory m = nullptr;
+    if (real_alloc_mem(dev, &ai, nullptr, &m) != 0 || !m) { LOGE("make_buf alloc fail"); return nullptr; }
+    real_bind_mem(dev, b, m, 0);
+    void *p = nullptr;
+    if (p_map && p_map(dev, m, 0, rq.size, 0, &p) == 0 && p) {
+        memcpy(p, data, size);
+        flush_mem(dev, m, 0, rq.size);
+        if (p_unmap) p_unmap(dev, m);
+    } else LOGE("make_buf map fail");
+    return b;
+}
+
+static VkBuffer  g_buf_pos = nullptr, g_buf_uv = nullptr;
+static VkBuffer  g_buf_ib[3] = {nullptr, nullptr, nullptr};
+static uint16_t *g_ib16[3] = {nullptr, nullptr, nullptr};
+
+static void ensure_mod_buffers(VkDevice dev) {
+    if (!dev) return;
+    if (!g_buf_pos && g_vb_pos && g_vb_pos_sz) g_buf_pos = make_buf(dev, g_vb_pos, g_vb_pos_sz);
+    if (!g_buf_uv && g_vb_uv && g_vb_uv_sz)    g_buf_uv  = make_buf(dev, g_vb_uv, g_vb_uv_sz);
+    for (int i = 0; i < 3; i++) {
+        if (g_buf_ib[i] || !g_ib_mod[i] || !g_ib_mod_n[i]) continue;
+        g_ib16[i] = (uint16_t *)malloc(g_ib_mod_n[i] * 2);
+        if (!g_ib16[i]) continue;
+        for (size_t k = 0; k < g_ib_mod_n[i]; k++) g_ib16[i][k] = (uint16_t)(g_ib_mod[i][k] & 0xFFFF);
+        g_buf_ib[i] = make_buf(dev, g_ib16[i], g_ib_mod_n[i] * 2);
+    }
+    static int lg = 0;
+    if (!lg) { lg = 1; LOGI("mod buffers pos=%p uv=%p ib=%p/%p/%p", (void *)g_buf_pos, (void *)g_buf_uv,
+                            (void *)g_buf_ib[0], (void *)g_buf_ib[1], (void *)g_buf_ib[2]); }
+}
+
+// 在 draw 之前记录拷贝命令：提交时按顺序执行，必定覆盖游戏自己的上传
+static bool gpu_replace(VkCommandBuffer cb, int part, const IbBind *ib, VkDevice dev) {
+    if (!real_copy_buf) return false;
+    ensure_mod_buffers(dev);
+    VbRec *r = vbrec_get(cb, 0);
+    CopyRegion rg{};
+    if (g_buf_pos && r && r->buf[0]) {
+        rg = CopyRegion{0, r->off[0], (VkDeviceSize)g_vb_pos_sz};
+        real_copy_buf(cb, g_buf_pos, r->buf[0], 1, &rg);
+    }
+    if (g_buf_uv && r && r->buf[1]) {
+        rg = CopyRegion{0, r->off[1], (VkDeviceSize)g_vb_uv_sz};
+        real_copy_buf(cb, g_buf_uv, r->buf[1], 1, &rg);
+    }
+    if (g_buf_ib[part] && g_ib_mod_n[part]) {
+        rg = CopyRegion{0, ib->off + (VkDeviceSize)PART_FIRST[part] * 2, (VkDeviceSize)(g_ib_mod_n[part] * 2)};
+        real_copy_buf(cb, g_buf_ib[part], ib->buf, 1, &rg);
+    }
+    static int lg = 0;
+    if (!lg) { lg = 1; LOGI("gpu replace part=%d", part); }
+    return true;
 }
 
 // 导出当前 draw 绑定的所有顶点缓冲，用于离线分析真实布局
@@ -544,7 +670,8 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     if (g_enabled && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
                         if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); list_bufs(); }
-                        if (g_cfg_probe) probe_vb0(cb);
+                        if (g_cfg_probe == 1) probe_shift(cb, 0, 40, 3, 10.0f);   // 位置 +10
+                        else if (g_cfg_probe == 2) probe_shift(cb, 1, 20, 2, 0.5f); // UV +0.5
                         int part = -1;
                         for (int pi = 0; pi < 3; pi++)
                             if (firstIndex == PART_FIRST[pi] && indexCount == PART_COUNT[pi]) part = pi;
@@ -555,8 +682,13 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                             if (!dup && seen_n < 16) { seen[seen_n++] = indexCount; LOGI("nomatch size=%zu first=%u count=%u", n, firstIndex, indexCount); }
                         }
                         if (part >= 0) {
-                            replace_part(cb, part, base, ib, e);
-                            if (g_cfg_ib && g_ib_mod_n[part]) indexCount = (uint32_t)g_ib_mod_n[part];
+                            if (g_cfg_mode == 2) {
+                                if (gpu_replace(cb, part, ib, e->dev) && g_ib_mod_n[part])
+                                    indexCount = (uint32_t)g_ib_mod_n[part];
+                            } else {
+                                replace_part(cb, part, base, ib, e);
+                                if (g_cfg_ib && g_ib_mod_n[part]) indexCount = (uint32_t)g_ib_mod_n[part];
+                            }
                         }
                     }
                 }
@@ -582,6 +714,21 @@ extern "C" PFN_vkVoidFunction ys_vkGetDeviceProcAddr(VkDevice dev, const char *n
     if (!strcmp(name, "vkCreateBuffer")) {
         if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCreateBuffer;
+    }
+    if (!strcmp(name, "vkCreateDevice")) {
+        if (!real_create_dev) { real_create_dev = (PFN_vkCreateDevice)p; LOGI("intercept vkCreateDevice"); }
+        return (PFN_vkVoidFunction)ys_vkCreateDevice;
+    }
+    if (!strcmp(name, "vkAllocateMemory")) { if (!real_alloc_mem) real_alloc_mem = (PFN_vkAllocateMemory)p; return p; }
+    if (!strcmp(name, "vkGetBufferMemoryRequirements")) { if (!real_get_buf_req) real_get_buf_req = (PFN_vkGetBufferMemoryRequirements)p; return p; }
+    if (!strcmp(name, "vkGetPhysicalDeviceMemoryProperties")) { if (!real_get_mem_props) real_get_mem_props = (PFN_vkGetPhysicalDeviceMemoryProperties)p; return p; }
+    if (!strcmp(name, "vkCmdCopyBuffer")) {
+        if (!real_copy_buf) { real_copy_buf = (PFN_vkCmdCopyBuffer)p; LOGI("intercept vkCmdCopyBuffer"); }
+        return p;
+    }
+    if (!strcmp(name, "vkDestroyBuffer")) {
+        if (!real_destroy_buf) { real_destroy_buf = (PFN_vkDestroyBuffer)p; LOGI("intercept vkDestroyBuffer"); }
+        return (PFN_vkVoidFunction)ys_vkDestroyBuffer;
     }
     if (!strcmp(name, "vkBindBufferMemory")) {
         if (!real_bind_mem) { real_bind_mem = (PFN_vkBindBufferMemory)p; LOGI("intercept vkBindBufferMemory"); }
@@ -619,6 +766,21 @@ extern "C" PFN_vkVoidFunction ys_vkGetInstanceProcAddr(VkInstance inst, const ch
     if (!strcmp(name, "vkCreateBuffer")) {
         if (!real_create_buf) { real_create_buf = (PFN_vkCreateBuffer)p; LOGI("intercept(i) vkCreateBuffer"); }
         return (PFN_vkVoidFunction)ys_vkCreateBuffer;
+    }
+    if (!strcmp(name, "vkCreateDevice")) {
+        if (!real_create_dev) { real_create_dev = (PFN_vkCreateDevice)p; LOGI("intercept vkCreateDevice"); }
+        return (PFN_vkVoidFunction)ys_vkCreateDevice;
+    }
+    if (!strcmp(name, "vkAllocateMemory")) { if (!real_alloc_mem) real_alloc_mem = (PFN_vkAllocateMemory)p; return p; }
+    if (!strcmp(name, "vkGetBufferMemoryRequirements")) { if (!real_get_buf_req) real_get_buf_req = (PFN_vkGetBufferMemoryRequirements)p; return p; }
+    if (!strcmp(name, "vkGetPhysicalDeviceMemoryProperties")) { if (!real_get_mem_props) real_get_mem_props = (PFN_vkGetPhysicalDeviceMemoryProperties)p; return p; }
+    if (!strcmp(name, "vkCmdCopyBuffer")) {
+        if (!real_copy_buf) { real_copy_buf = (PFN_vkCmdCopyBuffer)p; LOGI("intercept vkCmdCopyBuffer"); }
+        return p;
+    }
+    if (!strcmp(name, "vkDestroyBuffer")) {
+        if (!real_destroy_buf) { real_destroy_buf = (PFN_vkDestroyBuffer)p; LOGI("intercept vkDestroyBuffer"); }
+        return (PFN_vkVoidFunction)ys_vkDestroyBuffer;
     }
     if (!strcmp(name, "vkBindBufferMemory")) {
         if (!real_bind_mem) { real_bind_mem = (PFN_vkBindBufferMemory)p; LOGI("intercept(i) vkBindBufferMemory"); }
@@ -701,6 +863,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "flush=", 6)) g_cfg_flush = atoi(line + 6);
                 else if (!strncmp(line, "ibsize=", 7)) g_ib_size = atoi(line + 7);
                 else if (!strncmp(line, "probe=", 6)) g_cfg_probe = atoi(line + 6);
+                else if (!strncmp(line, "mode=", 5)) g_cfg_mode = atoi(line + 5);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
