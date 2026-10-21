@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.8-lsp"
+#define YSMOD_VER "v2.9-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -611,6 +611,8 @@ struct CopyRegion { VkDeviceSize srcOffset, dstOffset, size; };
 
 static int g_cfg_mode = 2;   // 1 = CPU 直写（会闪），2 = GPU 拷贝
 static int g_copy_pos = 1, g_copy_uv = 1, g_copy_ib = 1, g_copy_blend = 1;
+static int g_cfg_wprobe = 0;   // 1 = 权重全写成「100% 骨骼0」，验证缓冲是否被使用
+static VkBuffer g_buf_wconst = nullptr;
 
 static int find_mem_type(uint32_t bits) {
     if (!g_phys || !real_get_mem_props) return -1;
@@ -718,12 +720,26 @@ static bool gpu_replace(VkCommandBuffer cb, int part, const IbBind *ib, VkDevice
             }
         }
         if (tgt) {
+            VkBuffer srcb = g_buf_blend;
+            if (g_cfg_wprobe) {
+                if (!g_buf_wconst && g_blend_size > 0) {
+                    uint8_t *tmp = (uint8_t *)calloc(1, (size_t)g_blend_size);
+                    if (tmp) {
+                        for (size_t o = 0; o + 32 <= (size_t)g_blend_size; o += 32) {
+                            *(float *)(tmp + o) = 1.0f;   // w0 = 1
+                        }
+                        g_buf_wconst = make_buf(dev, tmp, (size_t)g_blend_size);
+                        free(tmp);
+                    }
+                }
+                if (g_buf_wconst) srcb = g_buf_wconst;
+            }
             // 同尺寸的缓冲可能有多份，全部写一遍
             int cnt = 0;
             for (int i = 0; i < g_bufent_n && cnt < 8; i++) {
                 if (!g_bufent[i].mem || g_bufent[i].size != (VkDeviceSize)g_blend_size) continue;
                 CopyRegion rb{0, g_bufent[i].off, (VkDeviceSize)g_vb_blend_sz};
-                real_copy_buf(cb, g_buf_blend, g_bufent[i].buf, 1, &rb);
+                real_copy_buf(cb, srcb, g_bufent[i].buf, 1, &rb);
                 cnt++;
             }
             static int lg = 0;
@@ -1118,6 +1134,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "copyuv=", 7)) g_copy_uv = atoi(line + 7);
                 else if (!strncmp(line, "copyib=", 7)) g_copy_ib = atoi(line + 7);
                 else if (!strncmp(line, "copyblend=", 10)) g_copy_blend = atoi(line + 10);
+                else if (!strncmp(line, "wprobe=", 7)) g_cfg_wprobe = atoi(line + 7);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
