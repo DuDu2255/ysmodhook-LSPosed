@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LSPosed 读取此数组作为「推荐作用域」，勾选模块时自动勾上原神 -->
+    <string-array name="xposed_scope">
+        <item>com.miHoYo.Yuanshen</item>
+    </string-array>
+</resources>
