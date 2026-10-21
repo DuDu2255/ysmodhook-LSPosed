@@ -16,12 +16,14 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v1.7-lsp"
+#define YSMOD_VER "v1.8-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
 static int  g_cfg_ib = 1;      // 替换索引缓冲
 static int  g_cfg_vb = 1;      // 替换顶点缓冲
+static int  g_enabled = 1;     // 模块开关（设置界面）
+static int  g_ib_size = 147630; // 目标合并索引缓冲大小，0 = 不限制
 
 // ── mod 资源 ──────────────────────────────────────────────────────
 static uint32_t *g_ib_mod[3] = {nullptr, nullptr, nullptr};   // head/body/dress
@@ -486,12 +488,18 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                         indexCount = 0;
                     }
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
-                    if (n == 147630) {
+                    if (g_enabled && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
                         if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); }
                         int part = -1;
                         for (int pi = 0; pi < 3; pi++)
                             if (firstIndex == PART_FIRST[pi] && indexCount == PART_COUNT[pi]) part = pi;
+                        if (part < 0) {
+                            static uint32_t seen[16]; static int seen_n = 0;
+                            bool dup = false;
+                            for (int k = 0; k < seen_n; k++) if (seen[k] == indexCount) dup = true;
+                            if (!dup && seen_n < 16) { seen[seen_n++] = indexCount; LOGI("nomatch size=%zu first=%u count=%u", n, firstIndex, indexCount); }
+                        }
                         if (part >= 0) {
                             replace_part(cb, part, base, ib, e);
                             if (g_cfg_ib && g_ib_mod_n[part]) indexCount = (uint32_t)g_ib_mod_n[part];
@@ -614,7 +622,8 @@ static void *worker(void *) {
 
 // ─── JNI 入口：由 LSPosed 模块在目标进程里调用 ───
 extern "C" JNIEXPORT void JNICALL
-Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir) {
+Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jboolean enabled) {
+    g_enabled = enabled ? 1 : 0;
     if (outDir) {
         const char *s = env->GetStringUTFChars(outDir, nullptr);
         if (s) {
@@ -634,6 +643,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir) {
                 else if (!strncmp(line, "ib=", 3)) g_cfg_ib = atoi(line + 3);
                 else if (!strncmp(line, "vb=", 3)) g_cfg_vb = atoi(line + 3);
                 else if (!strncmp(line, "flush=", 6)) g_cfg_flush = atoi(line + 6);
+                else if (!strncmp(line, "ibsize=", 7)) g_ib_size = atoi(line + 7);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);

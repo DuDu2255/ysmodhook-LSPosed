@@ -19,7 +19,7 @@ public class Entry implements IXposedHookLoadPackage {
     private static final String TARGET = "com.miHoYo.Yuanshen";
     private static final String SELF = "com.ysmod.hook";
 
-    private static native void start(String outDir);
+    private static native void start(String outDir, boolean enabled);
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
@@ -44,7 +44,17 @@ public class Entry implements IXposedHookLoadPackage {
                     // 目标包名固定，直接用自身数据目录。
                     String out = "/data/data/" + TARGET + "/files";
                     new File(out).mkdirs();
-                    start(out);
+                    boolean enabled = true;
+                    try {
+                        de.robv.android.xposed.XSharedPreferences sp =
+                                new de.robv.android.xposed.XSharedPreferences(SELF, "ysmod");
+                        sp.reload();
+                        enabled = sp.getBoolean("replace", true);
+                    } catch (Throwable t) {
+                        Log.i(TAG, "prefs unavailable: " + t);
+                    }
+                    Log.i(TAG, "replace enabled = " + enabled);
+                    start(out, enabled);
                     return;
                 } catch (Throwable t) {
                     Log.e(TAG, "load/start failed: " + t);
