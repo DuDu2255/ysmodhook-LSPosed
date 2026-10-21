@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.4-lsp"
+#define YSMOD_VER "v3.5-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -1086,6 +1086,19 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                             if (!dup && seen_n < 16) { seen[seen_n++] = indexCount; LOGI("nomatch size=%zu first=%u count=%u", n, firstIndex, indexCount); }
                         }
                         if (part >= 0) {
+                            {
+                                static int dl = 0;
+                                if (!dl) {
+                                    dl = 1;
+                                    VbRec *vr2 = vbrec_get(cb, 0);
+                                    BufEnt *b0 = (vr2 && vr2->buf[0]) ? lookup_buf(vr2->buf[0]) : nullptr;
+                                    LOGI("draw part=%d vb0=%p size=%llu off=%llu vtxOff=%d inst=%u cnt=%u first=%u",
+                                         part, (void *)(vr2 ? vr2->buf[0] : nullptr),
+                                         (unsigned long long)(b0 ? b0->size : 0),
+                                         (unsigned long long)(vr2 ? vr2->off[0] : 0),
+                                         vertexOffset, instanceCount, indexCount, firstIndex);
+                                }
+                            }
                             if (g_cfg_mode == 2) {
                                 if (gpu_replace(cb, part, ib, e->dev) && g_ib_mod_n[part])
                                     indexCount = (uint32_t)g_ib_mod_n[part];
