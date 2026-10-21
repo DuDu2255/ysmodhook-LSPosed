@@ -18,6 +18,7 @@
 #define YSMOD_VER "v1.1-lsp"
 
 static char g_outdir[256] = {0};
+static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
 
 typedef struct VkDevice_T        *VkDevice;
 typedef struct VkInstance_T      *VkInstance;
@@ -253,11 +254,15 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     const uint8_t *r = base + start;
                     uint32_t c = (esz == 2) ? fnv16((const uint16_t *)r, len / 2, 0x811C9DC5u)
                                             : fnv32((const uint32_t *)r, len / 4, 0x811C9DC5u);
-                    if (hash_new(c))
-                        LOGI("[C] %08x idx=%u first=%u vtx=%d", c, indexCount, firstIndex, vertexOffset);
                     uint32_t d2 = fnv_expand(r, len / esz, esz, 0x811C9DC5u);
                     if (hash_new(d2))
                         LOGI("[E] %08x idx=%u first=%u", d2, indexCount, firstIndex);
+                    // 验证：head = first 0 / count 28278，命中就让这次 draw 空转
+                    if (g_test_mode == 1 && firstIndex == 0 && indexCount == 28278) {
+                        static int logged = 0;
+                        if (!logged) { logged = 1; LOGI("TEST: skip head draw"); }
+                        indexCount = 0;
+                    }
                 }
                 if (p_unmap) p_unmap(e->dev, e->mem);
             }
@@ -364,6 +369,21 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir) {
         }
     }
     LOGI("%s starting (pid=%d) outdir=%s", YSMOD_VER, getpid(), g_outdir);
+    {
+        char cfg[320];
+        snprintf(cfg, sizeof(cfg), "%s/ysmod.cfg", g_outdir);
+        FILE *f = fopen(cfg, "r");
+        if (f) {
+            char line[128];
+            while (fgets(line, sizeof(line), f)) {
+                if (!strncmp(line, "test=", 5)) g_test_mode = atoi(line + 5);
+            }
+            fclose(f);
+            LOGI("cfg test=%d", g_test_mode);
+        } else {
+            LOGI("cfg not found (%s)", cfg);
+        }
+    }
     pthread_t t;
     if (pthread_create(&t, nullptr, worker, nullptr) == 0) pthread_detach(t);
 }
