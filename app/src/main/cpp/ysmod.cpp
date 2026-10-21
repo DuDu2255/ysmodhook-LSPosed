@@ -18,7 +18,7 @@ extern char *g_logpath_ptr(void);
 static void flog(const char *fmt, ...);
 #define LOGI(...) do { __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__); flog(__VA_ARGS__); } while (0)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.8-lsp"
+#define YSMOD_VER "v3.9-lsp"
 
 static char g_outdir[256] = {0};
 
@@ -339,7 +339,7 @@ static BufInfo *find_buf(VkBuffer b) {
 }
 
 // 简化：单独存 buffer 指针
-struct BufEnt { VkBuffer buf; VkDevice dev; VkDeviceMemory mem; VkDeviceSize off; VkDeviceSize size; uint32_t hash; int hashed; int hashed2; };
+struct BufEnt { VkBuffer buf; VkDevice dev; VkDeviceMemory mem; VkDeviceSize off; VkDeviceSize size; uint32_t hash; int hashed; int hashed2; int usage; };
 static BufEnt g_bufent[8192];
 static int    g_bufent_n = 0;
 
@@ -353,9 +353,10 @@ extern "C" int ys_vkCreateBuffer(VkDevice dev, const void *ci, const void *alloc
     int r = real_create_buf ? real_create_buf(dev, ci, alloc, out) : -1;
     if (r == 0 && ci && out && *out) {
         VkDeviceSize size = *(const VkDeviceSize *)((const char *)ci + 24);
+        int usage = *(const int *)((const char *)ci + 32);
         pthread_mutex_lock(&g_mtx);
         if (g_bufent_n < 8192) {
-            BufEnt e{}; e.buf = *out; e.dev = dev; e.size = size;
+            BufEnt e{}; e.buf = *out; e.dev = dev; e.size = size; e.usage = usage;
             g_bufent[g_bufent_n++] = e;
         }
         pthread_mutex_unlock(&g_mtx);
@@ -1063,6 +1064,20 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                 size_t start = (size_t)ib->off + (size_t)firstIndex * esz;
                 size_t len   = (size_t)indexCount * esz;
                 if (start + len <= n) {
+                    if (g_cfg_vbdump || g_cfg_bmdump) {
+                        static int dl2 = 0;
+                        if (dl2 < 6) {
+                            dl2++;
+                            VbRec *vr = vbrec_get(cb, 0);
+                            BufEnt *b0 = (vr && vr->buf[0]) ? lookup_buf(vr->buf[0]) : nullptr;
+                            LOGI("diag: vb0=%p usage=0x%x size=%llu off=%llu vtxOff=%d inst=%u cnt=%u first=%u esz=%u ib=%p",
+                                 (void *)(vr ? vr->buf[0] : nullptr), b0 ? b0->usage : -1,
+                                 (unsigned long long)(b0 ? b0->size : 0),
+                                 (unsigned long long)(vr ? vr->off[0] : 0),
+                                 vertexOffset, instanceCount, indexCount, firstIndex, esz,
+                                 (void *)ib->buf);
+                        }
+                    }
                     // —— 批量回读：每帧拷一个缓冲，下一帧落盘 ——
                     if (g_cfg_bmdump) {
                         VbRec *vr3 = vbrec_get(cb, 0);
@@ -1070,7 +1085,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                         VkDevice dv = ve3 ? ve3->dev : nullptr;
                         if (dv) {
                             if (g_bm_state == 0) {
-                                while (g_bm_cursor < g_bufent_n) {
+                                while (g_bm_cursor < g_bufent_n && g_bm_cursor < 64) {
                                     BufEnt *t = &g_bufent[g_bm_cursor];
                                     if (t->mem && t->size >= 2048 && t->size <= 65536 && t->dev == dv) break;
                                     g_bm_cursor++;
