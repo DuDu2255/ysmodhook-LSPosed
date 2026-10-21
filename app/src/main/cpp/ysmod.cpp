@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.3-lsp"
+#define YSMOD_VER "v2.4-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -495,7 +495,9 @@ static VkBuffer make_buf(VkDevice dev, const void *data, size_t size) {
     return b;
 }
 
-static VkBuffer  g_buf_pos = nullptr, g_buf_uv = nullptr;
+static int       g_cfg_blend = 1;
+static int       g_blend_size = 639648;   // 原版骨骼权重缓冲大小 = 19989 * 32
+static VkBuffer  g_buf_pos = nullptr, g_buf_uv = nullptr, g_buf_blend = nullptr;
 static VkBuffer  g_buf_ib[3] = {nullptr, nullptr, nullptr};
 static uint16_t *g_ib16[3] = {nullptr, nullptr, nullptr};
 
@@ -503,6 +505,8 @@ static void ensure_mod_buffers(VkDevice dev) {
     if (!dev) return;
     if (!g_buf_pos && g_vb_pos && g_vb_pos_sz) g_buf_pos = make_buf(dev, g_vb_pos, g_vb_pos_sz);
     if (!g_buf_uv && g_vb_uv && g_vb_uv_sz)    g_buf_uv  = make_buf(dev, g_vb_uv, g_vb_uv_sz);
+    if (!g_buf_blend && g_vb_blend && g_vb_blend_sz && g_cfg_blend)
+        g_buf_blend = make_buf(dev, g_vb_blend, g_vb_blend_sz);
     for (int i = 0; i < 3; i++) {
         if (g_buf_ib[i] || !g_ib_mod[i] || !g_ib_mod_n[i]) continue;
         g_ib16[i] = (uint16_t *)malloc(g_ib_mod_n[i] * 2);
@@ -532,6 +536,22 @@ static bool gpu_replace(VkCommandBuffer cb, int part, const IbBind *ib, VkDevice
     if (g_buf_ib[part] && g_ib_mod_n[part]) {
         rg = CopyRegion{0, ib->off + (VkDeviceSize)PART_FIRST[part] * 2, (VkDeviceSize)(g_ib_mod_n[part] * 2)};
         real_copy_buf(cb, g_buf_ib[part], ib->buf, 1, &rg);
+    }
+    // 骨骼权重（原版按顶点 32 字节，走 SSBO，不在顶点绑定里）——按尺寸定位
+    if (g_buf_blend && g_blend_size > 0) {
+        VkBuffer tgt = nullptr;
+        VkDeviceSize toff = 0;
+        for (int i = g_bufent_n - 1; i >= 0; i--) {
+            if (g_bufent[i].mem && (VkDeviceSize)g_blend_size == g_bufent[i].size) {
+                tgt = g_bufent[i].buf; toff = g_bufent[i].off; break;
+            }
+        }
+        if (tgt) {
+            CopyRegion rb{0, toff, (VkDeviceSize)g_vb_blend_sz};
+            real_copy_buf(cb, g_buf_blend, tgt, 1, &rb);
+            static int lg = 0;
+            if (!lg) { lg = 1; LOGI("blend replaced -> buf size=%d", g_blend_size); }
+        }
     }
     static int lg = 0;
     if (!lg) { lg = 1; LOGI("gpu replace part=%d", part); }
@@ -864,6 +884,8 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "ibsize=", 7)) g_ib_size = atoi(line + 7);
                 else if (!strncmp(line, "probe=", 6)) g_cfg_probe = atoi(line + 6);
                 else if (!strncmp(line, "mode=", 5)) g_cfg_mode = atoi(line + 5);
+                else if (!strncmp(line, "blend=", 6)) g_cfg_blend = atoi(line + 6);
+                else if (!strncmp(line, "blendsize=", 10)) g_blend_size = atoi(line + 10);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
