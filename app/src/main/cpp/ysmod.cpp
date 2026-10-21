@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v2.4-lsp"
+#define YSMOD_VER "v2.5-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -24,7 +24,9 @@ static int  g_cfg_ib = 1;      // 替换索引缓冲
 static int  g_cfg_vb = 1;      // 替换顶点缓冲
 static int  g_enabled = 1;     // 模块开关（设置界面）
 static int  g_ib_size = 147630; // 目标合并索引缓冲大小，0 = 不限制
-static int  g_cfg_probe = 0;   // 1 = 把 binding0 的 x 全体 +0.5，用于确认它是不是真位置数据
+static int  g_cfg_probe = 0;   // 1 = 位置探针，2 = UV 探针
+static int  g_cfg_verbose = 0; // 1 = 输出每个缓冲的 hash 日志
+static int  g_cfg_dump = 0;    // 1 = 导出顶点/权重缓冲供离线分析
 
 // ── mod 资源 ──────────────────────────────────────────────────────
 static uint32_t *g_ib_mod[3] = {nullptr, nullptr, nullptr};   // head/body/dress
@@ -541,9 +543,25 @@ static bool gpu_replace(VkCommandBuffer cb, int part, const IbBind *ib, VkDevice
     if (g_buf_blend && g_blend_size > 0) {
         VkBuffer tgt = nullptr;
         VkDeviceSize toff = 0;
+        BufEnt *tb = nullptr;
         for (int i = g_bufent_n - 1; i >= 0; i--) {
             if (g_bufent[i].mem && (VkDeviceSize)g_blend_size == g_bufent[i].size) {
-                tgt = g_bufent[i].buf; toff = g_bufent[i].off; break;
+                tgt = g_bufent[i].buf; toff = g_bufent[i].off; tb = &g_bufent[i]; break;
+            }
+        }
+        if (tgt && tb && g_cfg_dump) {
+            static int db = 0;
+            if (!db) {
+                db = 1;
+                void *p = nullptr;
+                if (p_map && p_map(tb->dev, tb->mem, tb->off, tb->size, 0, &p) == 0 && p) {
+                    invalidate_mem(tb->dev, tb->mem, tb->off, tb->size);
+                    char path[400];
+                    snprintf(path, sizeof(path), "%s/blend_target.bin", g_outdir);
+                    FILE *f = fopen(path, "wb");
+                    if (f) { fwrite(p, 1, (size_t)tb->size, f); fclose(f); LOGI("dumped %s", path); }
+                    if (p_unmap) p_unmap(tb->dev, tb->mem);
+                }
             }
         }
         if (tgt) {
@@ -649,12 +667,12 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     uint32_t b = (esz == 2) ? fnv16((const uint16_t *)base, n / 2, 0x811C9DC5u)
                                             : fnv32((const uint32_t *)base, n / 4, 0x811C9DC5u);
                     e->hash = a; e->hashed = 1;
-                    LOGI("[A] %08x [B] %08x size=%llu esz=%u", a, b, (unsigned long long)n, esz);
+                    if (g_cfg_verbose) LOGI("[A] %08x [B] %08x size=%llu esz=%u", a, b, (unsigned long long)n, esz);
                 }
                 if (!e->hashed2) {
                     e->hashed2 = 1;
                     uint32_t d = fnv_expand(base, n / esz, esz, 0x811C9DC5u);
-                    LOGI("[D] %08x idxs=%zu size=%llu esz=%u", d, n / esz, (unsigned long long)n, esz);
+                    if (g_cfg_verbose) LOGI("[D] %08x idxs=%zu size=%llu esz=%u", d, n / esz, (unsigned long long)n, esz);
                     // dump 大索引缓冲，供离线分析 hash
                     if (g_outdir[0] && n >= 100000 && n <= 300000) {
                         char path[320];
@@ -679,7 +697,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                                             : fnv32((const uint32_t *)r, len / 4, 0x811C9DC5u);
                     uint32_t d2 = fnv_expand(r, len / esz, esz, 0x811C9DC5u);
                     if (hash_new(d2))
-                        LOGI("[E] %08x idx=%u first=%u", d2, indexCount, firstIndex);
+                        if (g_cfg_verbose) LOGI("[E] %08x idx=%u first=%u", d2, indexCount, firstIndex);
                     // 验证：head = first 0 / count 28278，命中就让这次 draw 空转
                     if (g_test_mode == 1 && firstIndex == 0 && indexCount == 28278) {
                         static int logged = 0;
@@ -689,7 +707,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
                     if (g_enabled && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
-                        if (!dumped && firstIndex == 71181) { dumped = 1; dump_vbs(cb); list_bufs(); }
+                        if (!dumped && firstIndex == 71181 && g_cfg_dump) { dumped = 1; dump_vbs(cb); list_bufs(); }
                         if (g_cfg_probe == 1) probe_shift(cb, 0, 40, 3, 10.0f);   // 位置 +10
                         else if (g_cfg_probe == 2) probe_shift(cb, 1, 20, 2, 0.5f); // UV +0.5
                         int part = -1;
@@ -886,6 +904,8 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "mode=", 5)) g_cfg_mode = atoi(line + 5);
                 else if (!strncmp(line, "blend=", 6)) g_cfg_blend = atoi(line + 6);
                 else if (!strncmp(line, "blendsize=", 10)) g_blend_size = atoi(line + 10);
+                else if (!strncmp(line, "verbose=", 8)) g_cfg_verbose = atoi(line + 8);
+                else if (!strncmp(line, "dump=", 5)) g_cfg_dump = atoi(line + 5);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
