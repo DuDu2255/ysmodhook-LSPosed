@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.3-lsp"
+#define YSMOD_VER "v3.4-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -635,6 +635,14 @@ static int g_cfg_posprobe = 0; // 1 = 位置全写成同一点，验证位置缓
 static VkBuffer g_buf_wconst = nullptr;
 static VkBuffer g_buf_pconst = nullptr;
 
+// ── 原版顶点缓冲回读（GPU 拷到 host 可见暂存区，下一帧再读）────────
+static int        g_cfg_vbdump = 0;
+static VkBuffer   g_stage_buf  = nullptr;
+static void      *g_stage_ptr  = nullptr;
+static VkDeviceSize g_stage_sz = 0;
+static VkDeviceMemory g_stage_mem = nullptr;
+static int        g_stage_state = 0;   // 0=未开始 1=已记录拷贝 2=已读回
+
 static int find_mem_type(uint32_t bits) {
     if (!g_phys || !real_get_mem_props) return -1;
     MemProps mp{};
@@ -670,6 +678,32 @@ static VkBuffer make_buf(VkDevice dev, const void *data, size_t size) {
         flush_mem(dev, m, 0, rq.size);
         if (p_unmap) p_unmap(dev, m);
     } else LOGE("make_buf map fail");
+    return b;
+}
+
+// 分配一块 host 可见、常驻映射的暂存缓冲（用于 GPU→CPU 回读）
+static VkBuffer make_stage(VkDevice dev, size_t size, void **outptr) {
+    *outptr = nullptr;
+    if (!real_create_buf || !real_alloc_mem || !real_bind_mem || !real_get_buf_req || !size) return nullptr;
+    BufferCI ci{12, nullptr, 0, (VkDeviceSize)size, 0x1 | 0x80 | 0x40, 0, 0, nullptr};
+    VkBuffer b = nullptr;
+    if (real_create_buf(dev, &ci, nullptr, &b) != 0 || !b) { LOGE("stage create fail"); return nullptr; }
+    MemReqs rq{};
+    real_get_buf_req(dev, b, &rq);
+    int mt = find_mem_type(rq.memoryTypeBits);
+    if (mt < 0) { LOGE("stage no memtype"); return nullptr; }
+    AllocInfo ai{5, nullptr, rq.size, (uint32_t)mt};
+    VkDeviceMemory m = nullptr;
+    if (real_alloc_mem(dev, &ai, nullptr, &m) != 0 || !m) { LOGE("stage alloc fail"); return nullptr; }
+    real_bind_mem(dev, b, m, 0);
+    void *pp = nullptr;
+    if (!p_map || p_map(dev, m, 0, rq.size, 0, &pp) != 0 || !pp) { LOGE("stage map fail"); return nullptr; }
+    memset(pp, 0, (size_t)rq.size);
+    flush_mem(dev, m, 0, rq.size);
+    *outptr = pp;
+    g_stage_mem = m;
+    g_stage_sz = rq.size;
+    LOGI("stage buffer %p ptr=%p size=%llu", (void *)b, pp, (unsigned long long)rq.size);
     return b;
 }
 
@@ -999,6 +1033,31 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                 size_t start = (size_t)ib->off + (size_t)firstIndex * esz;
                 size_t len   = (size_t)indexCount * esz;
                 if (start + len <= n) {
+                    // —— 原版顶点缓冲回读：录一次 GPU 拷贝，下一帧读回落盘 ——
+                    if (g_cfg_vbdump) {
+                        VbRec *vr = vbrec_get(cb, 0);
+                        BufEnt *ve = (vr && vr->buf[0]) ? lookup_buf(vr->buf[0]) : nullptr;
+                        if (ve && ve->size) {
+                            if (g_stage_state == 0) {
+                                if (!g_stage_buf) g_stage_buf = make_stage(ve->dev, (size_t)ve->size, &g_stage_ptr);
+                                if (g_stage_buf && g_stage_ptr) {
+                                    VkDeviceSize nn = ve->size < g_stage_sz ? ve->size : g_stage_sz;
+                                    CopyRegion cr{0, 0, nn};
+                                    real_copy_buf(cb, vr->buf[0], g_stage_buf, 1, &cr);
+                                    g_stage_state = 1;
+                                    LOGI("vbdump: recorded %llu bytes (vb size %llu)",
+                                         (unsigned long long)nn, (unsigned long long)ve->size);
+                                }
+                            } else if (g_stage_state == 1) {
+                                invalidate_mem(ve->dev, g_stage_mem, 0, g_stage_sz);
+                                char path[400];
+                                snprintf(path, sizeof(path), "%s/vanilla_vb.bin", g_outdir);
+                                FILE *f = fopen(path, "wb");
+                                if (f) { fwrite(g_stage_ptr, 1, (size_t)g_stage_sz, f); fclose(f); LOGI("vbdump: wrote %s (%llu)", path, (unsigned long long)g_stage_sz); }
+                                g_stage_state = 2;
+                            }
+                        }
+                    }
                     const uint8_t *r = base + start;
                     uint32_t c = (esz == 2) ? fnv16((const uint16_t *)r, len / 2, 0x811C9DC5u)
                                             : fnv32((const uint32_t *)r, len / 4, 0x811C9DC5u);
@@ -1012,7 +1071,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                         indexCount = 0;
                     }
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
-                    if (g_enabled && g_cfg_enable && (g_ib_size == 0 || (int)n == g_ib_size)) {
+                    if (g_enabled && g_cfg_enable && !g_cfg_vbdump && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
                         if (!dumped && firstIndex == 71181 && g_cfg_dump) { dumped = 1; dump_vbs(cb); list_bufs(); dump_ubo(cb); dump_small_bufs(); }
                         if (g_cfg_probe == 1) probe_shift(cb, 0, 40, 3, 10.0f);   // 位置 +10
@@ -1284,6 +1343,7 @@ Java_com_ysmod_hook_Entry_start(JNIEnv *env, jclass clazz, jstring outDir, jbool
                 else if (!strncmp(line, "copyblend=", 10)) g_copy_blend = atoi(line + 10);
                 else if (!strncmp(line, "wprobe=", 7)) g_cfg_wprobe = atoi(line + 7);
                 else if (!strncmp(line, "posprobe=", 9)) g_cfg_posprobe = atoi(line + 9);
+                else if (!strncmp(line, "vbdump=", 7)) g_cfg_vbdump = atoi(line + 7);
             }
             fclose(f);
             LOGI("cfg test=%d ib=%d vb=%d", g_test_mode, g_cfg_ib, g_cfg_vb);
