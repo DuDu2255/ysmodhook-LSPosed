@@ -16,7 +16,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v3.2-lsp"
+#define YSMOD_VER "v3.3-lsp"
 
 static char g_outdir[256] = {0};
 static int  g_test_mode = 0;   // 1 = 跳过 head 绘制（验证能否精确接管某个部件）
@@ -824,6 +824,25 @@ extern "C" void ys_vkCmdBindDescriptorSets(VkCommandBuffer cb, int bindPoint, vo
     if (real_bind_desc) real_bind_desc(cb, bindPoint, layout, firstSet, count, sets, dynCount, dyn);
 }
 
+// 暴力导出：所有大小在 2KB~64KB 的缓冲（骨骼矩阵藏在这里）
+static void dump_small_bufs(void) {
+    int dumped = 0;
+    for (int i = 0; i < g_bufent_n && dumped < 40; i++) {
+        BufEnt *b = &g_bufent[i];
+        if (!b->mem || !p_map) continue;
+        if (b->size < 2048 || b->size > 65536) continue;
+        void *p = nullptr;
+        if (p_map(b->dev, b->mem, b->off, b->size, 0, &p) != 0 || !p) continue;
+        invalidate_mem(b->dev, b->mem, b->off, b->size);
+        char path[400];
+        snprintf(path, sizeof(path), "%s/sm_%d_%llu.bin", g_outdir, i, (unsigned long long)b->size);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(p, 1, (size_t)b->size, f); fclose(f); dumped++; }
+        if (p_unmap) p_unmap(b->dev, b->mem);
+    }
+    LOGI("dump_small_bufs: %d files", dumped);
+}
+
 // 导出当前 draw 通过描述符绑定的小 buffer（骨骼矩阵通常在这里）
 static void dump_ubo(VkCommandBuffer cb) {
     DSetRec *r = nullptr;
@@ -995,7 +1014,7 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     // —— 模型替换：按 (firstIndex, indexCount) 定位部件 ——
                     if (g_enabled && g_cfg_enable && (g_ib_size == 0 || (int)n == g_ib_size)) {
                         static int dumped = 0;
-                        if (!dumped && firstIndex == 71181 && g_cfg_dump) { dumped = 1; dump_vbs(cb); list_bufs(); dump_ubo(cb); }
+                        if (!dumped && firstIndex == 71181 && g_cfg_dump) { dumped = 1; dump_vbs(cb); list_bufs(); dump_ubo(cb); dump_small_bufs(); }
                         if (g_cfg_probe == 1) probe_shift(cb, 0, 40, 3, 10.0f);   // 位置 +10
                         else if (g_cfg_probe == 2) probe_shift(cb, 1, 20, 2, 0.5f); // UV +0.5
                         int part = -1;
