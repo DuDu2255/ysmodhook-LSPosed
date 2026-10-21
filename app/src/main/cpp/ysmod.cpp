@@ -15,7 +15,7 @@
 #define TAG "ysmod"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define YSMOD_VER "v0.9-lsp"
+#define YSMOD_VER "v1.0-lsp"
 
 typedef struct VkDevice_T        *VkDevice;
 typedef struct VkInstance_T      *VkInstance;
@@ -121,6 +121,17 @@ static uint32_t fnv32(const uint32_t *p, size_t n, uint32_t h) {
     for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x01000193u; }
     return h;
 }
+// 把 16 位索引零扩展成 32 位再按字节 hash —— 复刻 PC 端 R32_UINT 索引缓冲的 hash
+static uint32_t fnv_expand(const uint8_t *p, size_t count, uint32_t esz, uint32_t h) {
+    for (size_t i = 0; i < count; i++) {
+        uint32_t v = (esz == 2) ? (uint32_t)((const uint16_t *)p)[i] : ((const uint32_t *)p)[i];
+        h ^= (v & 0xFF);         h *= 0x01000193u;
+        h ^= ((v >> 8) & 0xFF);  h *= 0x01000193u;
+        h ^= ((v >> 16) & 0xFF); h *= 0x01000193u;
+        h ^= ((v >> 24) & 0xFF); h *= 0x01000193u;
+    }
+    return h;
+}
 
 static BufInfo *find_buf(VkBuffer b) {
     for (int i = g_bufs_n - 1; i >= 0; i--) if (g_bufs[i].dev && (VkBuffer)(uintptr_t)i == b) {}
@@ -133,7 +144,7 @@ static BufInfo *find_buf(VkBuffer b) {
 }
 
 // 简化：单独存 buffer 指针
-struct BufEnt { VkBuffer buf; VkDevice dev; VkDeviceMemory mem; VkDeviceSize off; VkDeviceSize size; uint32_t hash; int hashed; };
+struct BufEnt { VkBuffer buf; VkDevice dev; VkDeviceMemory mem; VkDeviceSize off; VkDeviceSize size; uint32_t hash; int hashed; int hashed2; };
 static BufEnt g_bufent[8192];
 static int    g_bufent_n = 0;
 
@@ -214,6 +225,11 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                     e->hash = a; e->hashed = 1;
                     LOGI("[A] %08x [B] %08x size=%llu esz=%u", a, b, (unsigned long long)n, esz);
                 }
+                if (!e->hashed2) {
+                    e->hashed2 = 1;
+                    uint32_t d = fnv_expand(base, n / esz, esz, 0x811C9DC5u);
+                    LOGI("[D] %08x idxs=%zu size=%llu esz=%u", d, n / esz, (unsigned long long)n, esz);
+                }
 
                 size_t start = (size_t)ib->off + (size_t)firstIndex * esz;
                 size_t len   = (size_t)indexCount * esz;
@@ -223,6 +239,9 @@ extern "C" void ys_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uin
                                             : fnv32((const uint32_t *)r, len / 4, 0x811C9DC5u);
                     if (hash_new(c))
                         LOGI("[C] %08x idx=%u first=%u vtx=%d", c, indexCount, firstIndex, vertexOffset);
+                    uint32_t d2 = fnv_expand(r, len / esz, esz, 0x811C9DC5u);
+                    if (hash_new(d2))
+                        LOGI("[E] %08x idx=%u first=%u", d2, indexCount, firstIndex);
                 }
                 if (p_unmap) p_unmap(e->dev, e->mem);
             }
